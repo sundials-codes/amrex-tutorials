@@ -9,241 +9,18 @@
 #endif
 
 #include "myfunc.H"
+#include "rl_tracking.H"
 
 #include <algorithm>
 #include <array>
-#include <cctype>
+#include <cstddef>
 #include <cmath>
-#include <fstream>
-#include <iomanip>
 #include <limits>
 #include <memory>
-#include <sstream>
 #include <string>
-#include <vector>
 
 using namespace amrex;
-
-namespace {
-
-struct RlAction {
-    int step = 0;
-    Real nlscoef = Real(-1.0);
-    int max_nonlinear_iters = 0;
-    Real eps_lin = Real(-1.0);
-    int lsetup_frequency = 0;
-};
-
-struct MlmgTelemetry {
-    long solve_calls = 0;
-    long iterations = 0;
-    Real wall_seconds = Real(0.0);
-    int last_iterations = 0;
-    Real last_residual = Real(-1.0);
-};
-
-struct PhiSummary {
-    Real min = Real(0.0);
-    Real max = Real(0.0);
-    Real sum = Real(0.0);
-    Real mean = Real(0.0);
-    Real l1 = Real(0.0);
-    Real l2 = Real(0.0);
-    Real linf = Real(0.0);
-    bool finite = true;
-};
-
-std::string Trim (std::string value)
-{
-    auto first = std::find_if_not(value.begin(), value.end(),
-                                  [](unsigned char c) { return std::isspace(c); });
-    auto last = std::find_if_not(value.rbegin(), value.rend(),
-                                 [](unsigned char c) { return std::isspace(c); }).base();
-    if (first >= last) {
-        return {};
-    }
-    return std::string(first, last);
-}
-
-std::string JsonEscape (const std::string& value)
-{
-    std::ostringstream os;
-    for (char c : value) {
-        switch (c) {
-        case '\\': os << "\\\\"; break;
-        case '"': os << "\\\""; break;
-        case '\n': os << "\\n"; break;
-        case '\r': os << "\\r"; break;
-        case '\t': os << "\\t"; break;
-        default: os << c; break;
-        }
-    }
-    return os.str();
-}
-
-std::vector<RlAction> LoadRlSchedule (const std::string& path)
-{
-    std::vector<RlAction> schedule;
-    if (path.empty()) {
-        return schedule;
-    }
-
-    std::ifstream input(path);
-    if (!input) {
-        amrex::Abort("Could not open rl_control.schedule: " + path);
-    }
-
-    std::string line;
-    int line_number = 0;
-    while (std::getline(input, line)) {
-        ++line_number;
-        line = Trim(line);
-        if (line.empty() || line[0] == '#') {
-            continue;
-        }
-
-        std::vector<std::string> fields;
-        std::stringstream ss(line);
-        std::string field;
-        while (std::getline(ss, field, ',')) {
-            fields.push_back(Trim(field));
-        }
-
-        if (fields.size() != 3 && fields.size() != 5) {
-            amrex::Abort("Bad rl_control.schedule line " + std::to_string(line_number) +
-                         ": expected step,nlscoef,max_nonlinear_iters"
-                         "[,eps_lin,lsetup_frequency]");
-        }
-
-        if (fields[0].empty() ||
-            (!std::isdigit(static_cast<unsigned char>(fields[0][0])) && fields[0][0] != '-'))
-        {
-            continue;
-        }
-
-        RlAction action;
-        action.step = std::stoi(fields[0]);
-        action.nlscoef = static_cast<Real>(std::stod(fields[1]));
-        action.max_nonlinear_iters = std::stoi(fields[2]);
-        if (fields.size() == 5) {
-            action.eps_lin = static_cast<Real>(std::stod(fields[3]));
-            action.lsetup_frequency = std::stoi(fields[4]);
-        }
-        schedule.push_back(action);
-    }
-
-    std::sort(schedule.begin(), schedule.end(),
-              [](const RlAction& a, const RlAction& b) { return a.step < b.step; });
-    return schedule;
-}
-
-SundialsIntegratorStats operator- (const SundialsIntegratorStats& after,
-                                   const SundialsIntegratorStats& before)
-{
-    SundialsIntegratorStats delta;
-    delta.valid = after.valid && before.valid;
-    delta.last_flag = after.last_flag;
-    delta.num_steps = after.num_steps - before.num_steps;
-    delta.step_attempts = after.step_attempts - before.step_attempts;
-    delta.rhs_evals_0 = after.rhs_evals_0 - before.rhs_evals_0;
-    delta.rhs_evals_1 = after.rhs_evals_1 - before.rhs_evals_1;
-    delta.num_lin_solv_setups = after.num_lin_solv_setups - before.num_lin_solv_setups;
-    delta.num_nonlin_solv_iters =
-        after.num_nonlin_solv_iters - before.num_nonlin_solv_iters;
-    delta.num_nonlin_solv_conv_fails =
-        after.num_nonlin_solv_conv_fails - before.num_nonlin_solv_conv_fails;
-    delta.num_step_solve_fails =
-        after.num_step_solve_fails - before.num_step_solve_fails;
-    delta.num_prec_evals = after.num_prec_evals - before.num_prec_evals;
-    delta.num_prec_solves = after.num_prec_solves - before.num_prec_solves;
-    delta.num_lin_iters = after.num_lin_iters - before.num_lin_iters;
-    delta.num_lin_conv_fails = after.num_lin_conv_fails - before.num_lin_conv_fails;
-    delta.num_lin_rhs_evals = after.num_lin_rhs_evals - before.num_lin_rhs_evals;
-    delta.hinused = after.hinused;
-    delta.hlast = after.hlast;
-    delta.hcur = after.hcur;
-    delta.tcur = after.tcur;
-    delta.current_gamma = after.current_gamma;
-    return delta;
-}
-
-MlmgTelemetry operator- (const MlmgTelemetry& after, const MlmgTelemetry& before)
-{
-    MlmgTelemetry delta;
-    delta.solve_calls = after.solve_calls - before.solve_calls;
-    delta.iterations = after.iterations - before.iterations;
-    delta.wall_seconds = after.wall_seconds - before.wall_seconds;
-    delta.last_iterations = after.last_iterations;
-    delta.last_residual = after.last_residual;
-    return delta;
-}
-
-PhiSummary SummarizePhi (const MultiFab& phi)
-{
-    PhiSummary summary;
-    summary.min = phi.min(0);
-    summary.max = phi.max(0);
-    summary.sum = phi.sum(0);
-    summary.l1 = phi.norm1(0);
-    summary.l2 = phi.norm2(0);
-    summary.linf = phi.norm0(0);
-    const auto npts = static_cast<Real>(phi.boxArray().numPts());
-    summary.mean = npts > Real(0.0) ? summary.sum / npts : Real(0.0);
-    summary.finite = std::isfinite(summary.min) && std::isfinite(summary.max) &&
-                     std::isfinite(summary.sum) && std::isfinite(summary.l1) &&
-                     std::isfinite(summary.l2) && std::isfinite(summary.linf);
-    return summary;
-}
-
-void WriteSundialsStats (std::ostream& os, const SundialsIntegratorStats& stats)
-{
-    os << "{\"valid\":" << (stats.valid ? "true" : "false")
-       << ",\"last_flag\":" << stats.last_flag
-       << ",\"num_steps\":" << stats.num_steps
-       << ",\"step_attempts\":" << stats.step_attempts
-       << ",\"rhs_evals_0\":" << stats.rhs_evals_0
-       << ",\"rhs_evals_1\":" << stats.rhs_evals_1
-       << ",\"num_lin_solv_setups\":" << stats.num_lin_solv_setups
-       << ",\"num_nonlin_solv_iters\":" << stats.num_nonlin_solv_iters
-       << ",\"num_nonlin_solv_conv_fails\":" << stats.num_nonlin_solv_conv_fails
-       << ",\"num_step_solve_fails\":" << stats.num_step_solve_fails
-       << ",\"num_prec_evals\":" << stats.num_prec_evals
-       << ",\"num_prec_solves\":" << stats.num_prec_solves
-       << ",\"num_lin_iters\":" << stats.num_lin_iters
-       << ",\"num_lin_conv_fails\":" << stats.num_lin_conv_fails
-       << ",\"num_lin_rhs_evals\":" << stats.num_lin_rhs_evals
-       << ",\"hinused\":" << stats.hinused
-       << ",\"hlast\":" << stats.hlast
-       << ",\"hcur\":" << stats.hcur
-       << ",\"tcur\":" << stats.tcur
-       << ",\"current_gamma\":" << stats.current_gamma
-       << "}";
-}
-
-void WriteMlmgTelemetry (std::ostream& os, const MlmgTelemetry& stats)
-{
-    os << "{\"solve_calls\":" << stats.solve_calls
-       << ",\"iterations\":" << stats.iterations
-       << ",\"wall_seconds\":" << stats.wall_seconds
-       << ",\"last_iterations\":" << stats.last_iterations
-       << ",\"last_residual\":" << stats.last_residual
-       << "}";
-}
-
-void WritePhiSummary (std::ostream& os, const PhiSummary& summary)
-{
-    os << "{\"min\":" << summary.min
-       << ",\"max\":" << summary.max
-       << ",\"sum\":" << summary.sum
-       << ",\"mean\":" << summary.mean
-       << ",\"l1\":" << summary.l1
-       << ",\"l2\":" << summary.l2
-       << ",\"linf\":" << summary.linf
-       << ",\"finite\":" << (summary.finite ? "true" : "false")
-       << "}";
-}
-
-} // namespace
+namespace rl = AdvDiffRl;
 
 int main (int argc, char* argv[])
 {
@@ -308,7 +85,7 @@ void main_main ()
     bool rl_skip_final_plotfiles = false;
     std::string rl_output_path = "advdiff_mlmg_rl_data.jsonl";
     std::string rl_schedule_path;
-    RlAction rl_current_action;
+    rl::Action rl_current_action;
 
     // inputs parameters
     {
@@ -381,18 +158,9 @@ void main_main ()
 #endif
     }
 
-    const std::vector<RlAction> rl_schedule = LoadRlSchedule(rl_schedule_path);
+    const auto rl_schedule = rl::LoadSchedule(rl_schedule_path);
     std::size_t rl_next_schedule = 0;
-
-    std::unique_ptr<std::ofstream> rl_output;
-    if (rl_data_enabled && ParallelDescriptor::IOProcessor()) {
-        rl_output = std::make_unique<std::ofstream>(rl_output_path);
-        if (!(*rl_output)) {
-            amrex::Abort("Could not open rl_data.output: " + rl_output_path);
-        }
-        rl_output->setf(std::ios::scientific);
-        *rl_output << std::setprecision(17);
-    }
+    auto rl_output = rl::OpenOutputFile(rl_data_enabled, rl_output_path);
 
     // **********************************
     // SIMULATION SETUP
@@ -494,7 +262,7 @@ void main_main ()
 
     std::unique_ptr<MLMGPreconditioner> mlmg_preconditioner;
     Real mlmg_gamma = std::numeric_limits<Real>::quiet_NaN();
-    MlmgTelemetry mlmg_telemetry;
+    rl::MlmgTelemetry mlmg_telemetry;
 
     auto build_mlmg_preconditioner = [&](Real gamma)
     {
@@ -555,7 +323,7 @@ void main_main ()
             (10.0 * std::numeric_limits<Real>::epsilon() *
              std::max(Real(1.0), std::max(std::abs(gamma), std::abs(mlmg_gamma))));
 
-        if (!jok) {
+        if (!jok || !same_gamma) {
             build_mlmg_preconditioner(gamma);
             jcur = true;
         }
@@ -574,11 +342,8 @@ void main_main ()
         ParallelDescriptor::ReduceRealMax(mlmg_solve_time);
 
         const int mlmg_iterations = mlmg_preconditioner->solver->getNumIters();
-        mlmg_telemetry.solve_calls += 1;
-        mlmg_telemetry.iterations += mlmg_iterations;
-        mlmg_telemetry.wall_seconds += mlmg_solve_time;
-        mlmg_telemetry.last_iterations = mlmg_iterations;
-        mlmg_telemetry.last_residual = mlmg_preconditioner->solver->getFinalResidual();
+        rl::RecordMlmgSolve(mlmg_telemetry, mlmg_iterations, mlmg_solve_time,
+                            mlmg_preconditioner->solver->getFinalResidual());
     };
 
     TimeIntegrator<MultiFab> integrator(phi, time);
@@ -593,31 +358,10 @@ void main_main ()
         integrator.set_time_step(dt);
     }
 
-    if (rl_output) {
-        const PhiSummary initial_phi = SummarizePhi(phi);
-        *rl_output << "{\"event\":\"run_start\""
-                   << ",\"n_cell\":" << n_cell
-                   << ",\"max_grid_size\":" << max_grid_size
-                   << ",\"nsteps\":" << nsteps
-                   << ",\"dt\":" << dt
-                   << ",\"adapt_dt\":" << (adapt_dt ? "true" : "false")
-                   << ",\"advCoeffx\":" << advCoeffx
-                   << ",\"advCoeffy\":" << advCoeffy
-                   << ",\"diffCoeffx\":" << diffCoeffx
-                   << ",\"diffCoeffy\":" << diffCoeffy
-                   << ",\"initial_nlscoef\":" << rl_current_action.nlscoef
-                   << ",\"initial_max_nonlinear_iters\":"
-                   << rl_current_action.max_nonlinear_iters
-                   << ",\"initial_eps_lin\":" << rl_current_action.eps_lin
-                   << ",\"initial_lsetup_frequency\":"
-                   << rl_current_action.lsetup_frequency
-                   << ",\"schedule\":\"" << JsonEscape(rl_schedule_path) << "\""
-                   << ",\"phi_initial\":";
-        WritePhiSummary(*rl_output, initial_phi);
-        *rl_output << "}\n";
-    } else if (rl_data_enabled) {
-        (void)SummarizePhi(phi);
-    }
+    const rl::RunMetadata rl_metadata{n_cell, max_grid_size, nsteps, dt, adapt_dt,
+                                      advCoeffx, advCoeffy, diffCoeffx, diffCoeffy,
+                                      rl_schedule_path};
+    rl::RecordRunStart(rl_output.get(), phi, rl_metadata, rl_current_action, rl_data_enabled);
 
     Real evolution_start_time = ParallelDescriptor::second();
     int completed_steps = 0;
@@ -625,12 +369,7 @@ void main_main ()
 
     for (int step = 1; step <= nsteps; ++step)
     {
-        while (rl_next_schedule < rl_schedule.size() &&
-               rl_schedule[rl_next_schedule].step <= step)
-        {
-            rl_current_action = rl_schedule[rl_next_schedule];
-            ++rl_next_schedule;
-        }
+        rl::ApplyScheduledAction(rl_schedule, rl_next_schedule, step, rl_current_action);
 
         if (integrator.supports_sundials_controls()) {
             integrator.set_sundials_nonlinear_control(
@@ -644,13 +383,10 @@ void main_main ()
         const Real time_start = time;
         time += dt;
 
-        PhiSummary phi_before;
-        SundialsIntegratorStats sundials_before;
-        MlmgTelemetry mlmg_before;
+        rl::StepSnapshot rl_before;
         if (rl_data_enabled) {
-            phi_before = SummarizePhi(phi);
-            sundials_before = integrator.get_sundials_stats();
-            mlmg_before = mlmg_telemetry;
+            rl_before = rl::CaptureStepSnapshot(phi, integrator.get_sundials_stats(),
+                                                mlmg_telemetry);
         }
 
         Real step_start_time = ParallelDescriptor::second();
@@ -665,47 +401,17 @@ void main_main ()
         amrex::Print() << "Advanced step " << step << " in " << step_stop_time << " seconds; dt = " << dt << " time = " << time << "\n";
 
         if (rl_data_enabled) {
-            const PhiSummary phi_after = SummarizePhi(phi);
-            const SundialsIntegratorStats sundials_after = integrator.get_sundials_stats();
-            const SundialsIntegratorStats sundials_delta = sundials_after - sundials_before;
-            const MlmgTelemetry mlmg_delta = mlmg_telemetry - mlmg_before;
-            const bool step_valid = phi_after.finite && sundials_after.last_flag >= 0;
+            const auto rl_after = rl::CaptureStepSnapshot(phi, integrator.get_sundials_stats(),
+                                                          mlmg_telemetry);
+            const bool step_valid = rl::RecordTransition(
+                rl_output.get(), step, time_start, time, dt, rl_current_action, step_stop_time,
+                rl_before, rl_after);
             episode_valid = episode_valid && step_valid;
-
-            if (rl_output) {
-                *rl_output << "{\"event\":\"transition\""
-                           << ",\"step\":" << step
-                           << ",\"time_start\":" << time_start
-                           << ",\"time_target\":" << time
-                           << ",\"dt\":" << dt
-                           << ",\"action\":{\"nlscoef\":" << rl_current_action.nlscoef
-                           << ",\"max_nonlinear_iters\":"
-                           << rl_current_action.max_nonlinear_iters
-                           << ",\"eps_lin\":" << rl_current_action.eps_lin
-                           << ",\"lsetup_frequency\":"
-                           << rl_current_action.lsetup_frequency << "}"
-                           << ",\"reward\":" << -step_stop_time
-                           << ",\"evolve_wall_seconds\":" << step_stop_time
-                           << ",\"valid\":" << (step_valid ? "true" : "false")
-                           << ",\"phi_before\":";
-                WritePhiSummary(*rl_output, phi_before);
-                *rl_output << ",\"phi_after\":";
-                WritePhiSummary(*rl_output, phi_after);
-                *rl_output << ",\"sundials_before\":";
-                WriteSundialsStats(*rl_output, sundials_before);
-                *rl_output << ",\"sundials_after\":";
-                WriteSundialsStats(*rl_output, sundials_after);
-                *rl_output << ",\"sundials_delta\":";
-                WriteSundialsStats(*rl_output, sundials_delta);
-                *rl_output << ",\"mlmg_delta\":";
-                WriteMlmgTelemetry(*rl_output, mlmg_delta);
-                *rl_output << "}\n";
-            }
 
             if (!step_valid) {
                 amrex::Print() << "Stopping after invalid RL data step " << step
-                               << "; SUNDIALS flag = " << sundials_after.last_flag
-                               << ", finite phi = " << (phi_after.finite ? "true" : "false")
+                               << "; SUNDIALS flag = " << rl_after.sundials.last_flag
+                               << ", finite phi = " << (rl_after.phi.finite ? "true" : "false")
                                << "\n";
                 break;
             }
@@ -755,21 +461,9 @@ void main_main ()
     amrex::Print() << "L1 error = " << error << std::endl;
 
     if (rl_data_enabled) {
-        const PhiSummary final_phi = SummarizePhi(phi);
-        episode_valid = episode_valid && final_phi.finite && std::isfinite(error);
-        if (rl_output) {
-            *rl_output << "{\"event\":\"run_end\""
-                       << ",\"completed_steps\":" << completed_steps
-                       << ",\"requested_steps\":" << nsteps
-                       << ",\"valid\":" << (episode_valid ? "true" : "false")
-                       << ",\"total_evolution_time\":" << evolution_stop_time
-                       << ",\"l1_error\":" << error
-                       << ",\"mlmg_total\":";
-            WriteMlmgTelemetry(*rl_output, mlmg_telemetry);
-            *rl_output << ",\"phi_final\":";
-            WritePhiSummary(*rl_output, final_phi);
-            *rl_output << "}\n";
-        }
+        episode_valid = rl::RecordRunEnd(rl_output.get(), phi, completed_steps, nsteps,
+                                         episode_valid, evolution_stop_time, error,
+                                         mlmg_telemetry);
     }
 }
 

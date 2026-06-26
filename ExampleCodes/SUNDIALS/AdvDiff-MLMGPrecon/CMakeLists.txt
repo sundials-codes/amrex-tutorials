@@ -3,7 +3,7 @@ if (AMReX_SPACEDIM EQUAL 1 OR NOT AMReX_LINEAR_SOLVERS)
 endif ()
 
 # List of source files
-set(_sources main.cpp myfunc.H)
+set(_sources main.cpp myfunc.H rl_tracking.H)
 list(TRANSFORM _sources PREPEND "Source/")
 
 # List of input files
