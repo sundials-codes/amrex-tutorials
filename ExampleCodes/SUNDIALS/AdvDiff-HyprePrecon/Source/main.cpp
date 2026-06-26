@@ -259,11 +259,6 @@ void main_main ()
     auto precond_setup = [&](MultiFab& /* S_data */, MultiFab& /* S_rhs */, const Real /* time */,
                              bool jok, bool& jcur, const Real gamma)
     {
-        const bool same_gamma = hypre_preconditioner &&
-            std::abs(gamma - hypre_gamma) <=
-            (10.0 * std::numeric_limits<Real>::epsilon() *
-             std::max(Real(1.0), std::max(std::abs(gamma), std::abs(hypre_gamma))));
-
         if (!jok) {
             build_hypre_preconditioner(gamma);
             jcur = true;

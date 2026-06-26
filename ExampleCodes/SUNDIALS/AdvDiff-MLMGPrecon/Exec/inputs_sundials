@@ -1,20 +1,20 @@
 n_cell = 256
-max_grid_size = 128
+max_grid_size = 256
 
-dt = 1.e-5
-nsteps = 100
+dt = 1.e-4
+nsteps = 10
 plot_int = 100
 
 advCoeffx = 100.
 advCoeffy = 100.
 
-diffCoeffx = 1.
-diffCoeffy = 1.
+diffCoeffx = 100.
+diffCoeffy = 100.
 
 # Use adaptive time stepping (multi-stage integrators only!) and set integrator relative and absolute tolerances
-# adapt_dt = true
-# reltol   = 1.0e-4
-# abstol   = 1.0e-9
+adapt_dt = true
+reltol   = 1.0e-4
+abstol   = 1.0e-10
 
 # INTEGRATION
 ## integration.type can take on the following values:
@@ -58,11 +58,12 @@ mlmg.max_iter = 100
 mlmg.max_fmg_iter = 0
 mlmg.verbose = 0
 mlmg.bottom_verbose = 0
-mlmg.use_hypre = 0
-mlmg.hypre_interface = 3  # 1 = structed, 2 = semi_structed, 3 = ij
+mlmg.use_hypre = 1
+mlmg.hypre_interface = 1  # 1 = structed, 2 = semi_structed, 3 = ij
 mlmg.hypre_options_namespace = hypre
 mlmg.reltol = 1.e-10
 mlmg.abstol = 0.0
 
 # HYPRE settings used when mlmg.use_hypre = 1 and mlmg.hypre_interface = 3
 hypre.hypre_solver = BoomerAMG
+hypre.write_matrix_files = True
