@@ -45,6 +45,7 @@ integration.sundials.max_linear_iters = 20
 # integration.sundials.max_nonlinear_iters = 3
 # integration.sundials.eps_lin = 0.05
 # integration.sundials.lsetup_frequency = 20
+# integration.sundials.jac_eval_frequency = 51
 # integration.sundials.abort_on_failure = 1
 
 # RL data collection

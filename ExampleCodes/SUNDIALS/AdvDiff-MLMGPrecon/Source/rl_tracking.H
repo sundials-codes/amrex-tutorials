@@ -26,6 +26,7 @@ struct Action {
     int max_nonlinear_iters = 0;
     amrex::Real eps_lin = amrex::Real(-1.0);
     int lsetup_frequency = 0;
+    long jac_eval_frequency = 0;
 };
 
 struct MlmgTelemetry {
@@ -122,10 +123,10 @@ inline std::vector<Action> LoadSchedule (const std::string& path)
             fields.push_back(Trim(field));
         }
 
-        if (fields.size() != 3 && fields.size() != 5) {
+        if (fields.size() != 3 && fields.size() != 5 && fields.size() != 6) {
             amrex::Abort("Bad rl_control.schedule line " + std::to_string(line_number) +
                          ": expected step,nlscoef,max_nonlinear_iters"
-                         "[,eps_lin,lsetup_frequency]");
+                         "[,eps_lin,lsetup_frequency[,jac_eval_frequency]]");
         }
 
         if (fields[0].empty() ||
@@ -138,9 +139,12 @@ inline std::vector<Action> LoadSchedule (const std::string& path)
         action.step = std::stoi(fields[0]);
         action.nlscoef = static_cast<amrex::Real>(std::stod(fields[1]));
         action.max_nonlinear_iters = std::stoi(fields[2]);
-        if (fields.size() == 5) {
+        if (fields.size() >= 5) {
             action.eps_lin = static_cast<amrex::Real>(std::stod(fields[3]));
             action.lsetup_frequency = std::stoi(fields[4]);
+        }
+        if (fields.size() == 6) {
+            action.jac_eval_frequency = std::stol(fields[5]);
         }
         schedule.push_back(action);
     }
@@ -331,6 +335,8 @@ inline void RecordRunStart (std::ostream* output, const amrex::MultiFab& phi,
             << ",\"initial_eps_lin\":" << initial_action.eps_lin
             << ",\"initial_lsetup_frequency\":"
             << initial_action.lsetup_frequency
+            << ",\"initial_jac_eval_frequency\":"
+            << initial_action.jac_eval_frequency
             << ",\"schedule\":\"" << JsonEscape(metadata.schedule_path) << "\""
             << ",\"phi_initial\":";
     WritePhiSummary(*output, initial_phi);
@@ -356,7 +362,9 @@ inline void WriteTransition (std::ostream& output, int step, amrex::Real time_st
            << action.max_nonlinear_iters
            << ",\"eps_lin\":" << action.eps_lin
            << ",\"lsetup_frequency\":"
-           << action.lsetup_frequency << "}"
+           << action.lsetup_frequency
+           << ",\"jac_eval_frequency\":"
+           << action.jac_eval_frequency << "}"
            << ",\"reward\":" << -step_wall_seconds
            << ",\"evolve_wall_seconds\":" << step_wall_seconds
            << ",\"valid\":" << (step_valid ? "true" : "false")

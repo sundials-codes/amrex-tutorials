@@ -142,6 +142,8 @@ void main_main ()
         pp_sundials.query("eps_lin", rl_current_action.eps_lin);
         pp_sundials.query("epsLin", rl_current_action.eps_lin);
         pp_sundials.query("lsetup_frequency", rl_current_action.lsetup_frequency);
+        pp_sundials.query("jac_eval_frequency", rl_current_action.jac_eval_frequency);
+        pp_sundials.query("jacevalfrequency", rl_current_action.jac_eval_frequency);
 
         ParmParse pp_rl_data("rl_data");
         pp_rl_data.query("enabled", rl_data_enabled);
@@ -371,7 +373,8 @@ void main_main ()
                 {rl_current_action.nlscoef,
                  rl_current_action.max_nonlinear_iters,
                  rl_current_action.eps_lin,
-                 rl_current_action.lsetup_frequency});
+                 rl_current_action.lsetup_frequency,
+                 rl_current_action.jac_eval_frequency});
         }
 
         // Set time to evolve to
