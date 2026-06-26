@@ -41,6 +41,17 @@ integration.sundials.method_e = ARKODE_ARK2_ERK_3_1_2
 integration.sundials.linear_solver = GMRES
 integration.sundials.linear_solver_preconditioning = LEFT
 integration.sundials.max_linear_iters = 20
+# integration.sundials.nlscoef = 0.1
+# integration.sundials.max_nonlinear_iters = 3
+# integration.sundials.eps_lin = 0.05
+# integration.sundials.lsetup_frequency = 20
+# integration.sundials.abort_on_failure = 1
+
+# RL data collection
+# rl_data.enabled = 0
+# rl_data.output = advdiff_mlmg_rl_data.jsonl
+# rl_data.skip_final_plotfiles = 0
+# rl_control.schedule = schedule.csv
 
 # MLMG settings for the SUNDIALS preconditioner solve
 mlmg.max_iter = 100
