@@ -8,10 +8,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cmath>
 #include <cstddef>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <memory>
 #include <ostream>
 #include <sstream>
@@ -65,6 +67,7 @@ struct RunMetadata {
     amrex::Real diffCoeffx = amrex::Real(0.0);
     amrex::Real diffCoeffy = amrex::Real(0.0);
     std::string schedule_path;
+    std::string control_mode;
 };
 
 inline std::string Trim (std::string value)
@@ -160,6 +163,98 @@ inline void ApplyScheduledAction (const std::vector<Action>& schedule, std::size
     while (next_schedule < schedule.size() && schedule[next_schedule].step <= step) {
         action = schedule[next_schedule];
         ++next_schedule;
+    }
+}
+
+inline bool ExtractJsonNumber (const std::string& text, const std::string& key,
+                               double& value)
+{
+    const std::string quoted_key = "\"" + key + "\"";
+    const auto key_pos = text.find(quoted_key);
+    if (key_pos == std::string::npos) {
+        return false;
+    }
+
+    const auto colon_pos = text.find(':', key_pos + quoted_key.size());
+    if (colon_pos == std::string::npos) {
+        return false;
+    }
+
+    auto number_pos = colon_pos + 1;
+    while (number_pos < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[number_pos])))
+    {
+        ++number_pos;
+    }
+
+    char* end = nullptr;
+    const char* start = text.c_str() + number_pos;
+    value = std::strtod(start, &end);
+    return end != start;
+}
+
+inline bool ParseJsonAction (const std::string& line, int step, Action& action)
+{
+    Action parsed = action;
+    parsed.step = step;
+
+    double value = 0.0;
+    bool saw_field = false;
+    if (ExtractJsonNumber(line, "nlscoef", value)) {
+        parsed.nlscoef = static_cast<amrex::Real>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "max_nonlinear_iters", value)) {
+        parsed.max_nonlinear_iters = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "eps_lin", value) || ExtractJsonNumber(line, "epsLin", value)) {
+        parsed.eps_lin = static_cast<amrex::Real>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "lsetup_frequency", value)) {
+        parsed.lsetup_frequency = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "jac_eval_frequency", value) ||
+        ExtractJsonNumber(line, "jacevalfrequency", value))
+    {
+        parsed.jac_eval_frequency = static_cast<long>(value);
+        saw_field = true;
+    }
+
+    if (saw_field) {
+        action = parsed;
+    }
+    return saw_field;
+}
+
+inline void BroadcastAction (Action& action)
+{
+    const int root = amrex::ParallelDescriptor::IOProcessorNumber();
+    amrex::ParallelDescriptor::Bcast(&action.step, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.nlscoef, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.max_nonlinear_iters, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.eps_lin, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.lsetup_frequency, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.jac_eval_frequency, 1, root);
+}
+
+inline void ReadJsonActionFromStdin (int step, Action& action)
+{
+    int ok = 1;
+    if (amrex::ParallelDescriptor::IOProcessor()) {
+        std::string line;
+        if (!std::getline(std::cin, line) || !ParseJsonAction(line, step, action)) {
+            ok = 0;
+        }
+    }
+
+    const int root = amrex::ParallelDescriptor::IOProcessorNumber();
+    amrex::ParallelDescriptor::Bcast(&ok, 1, root);
+    BroadcastAction(action);
+    if (ok == 0) {
+        amrex::Abort("Expected JSON action on stdin for rl_control.mode=stdin_json");
     }
 }
 
@@ -306,41 +401,84 @@ inline void WritePhiSummary (std::ostream& os, const PhiSummary& summary)
        << "}";
 }
 
+inline void WriteAction (std::ostream& os, const Action& action)
+{
+    os << "{\"nlscoef\":" << action.nlscoef
+       << ",\"max_nonlinear_iters\":" << action.max_nonlinear_iters
+       << ",\"eps_lin\":" << action.eps_lin
+       << ",\"lsetup_frequency\":" << action.lsetup_frequency
+       << ",\"jac_eval_frequency\":" << action.jac_eval_frequency
+       << "}";
+}
+
+inline void WriteRunStart (std::ostream& output, const amrex::MultiFab& phi,
+                           const RunMetadata& metadata, const Action& initial_action)
+{
+    const PhiSummary initial_phi = SummarizePhi(phi);
+
+    output << "{\"event\":\"run_start\""
+           << ",\"n_cell\":" << metadata.n_cell
+           << ",\"max_grid_size\":" << metadata.max_grid_size
+           << ",\"nsteps\":" << metadata.nsteps
+           << ",\"dt\":" << metadata.dt
+           << ",\"adapt_dt\":" << (metadata.adapt_dt ? "true" : "false")
+           << ",\"advCoeffx\":" << metadata.advCoeffx
+           << ",\"advCoeffy\":" << metadata.advCoeffy
+           << ",\"diffCoeffx\":" << metadata.diffCoeffx
+           << ",\"diffCoeffy\":" << metadata.diffCoeffy
+           << ",\"initial_nlscoef\":" << initial_action.nlscoef
+           << ",\"initial_max_nonlinear_iters\":"
+           << initial_action.max_nonlinear_iters
+           << ",\"initial_eps_lin\":" << initial_action.eps_lin
+           << ",\"initial_lsetup_frequency\":"
+           << initial_action.lsetup_frequency
+           << ",\"initial_jac_eval_frequency\":"
+           << initial_action.jac_eval_frequency
+           << ",\"schedule\":\"" << JsonEscape(metadata.schedule_path) << "\""
+           << ",\"control_mode\":\"" << JsonEscape(metadata.control_mode) << "\""
+           << ",\"phi_initial\":";
+    WritePhiSummary(output, initial_phi);
+    output << "}\n";
+}
+
 inline void RecordRunStart (std::ostream* output, const amrex::MultiFab& phi,
                             const RunMetadata& metadata, const Action& initial_action,
                             bool enabled)
 {
-    if (!enabled) {
+    if (!enabled || output == nullptr) {
         return;
     }
+    WriteRunStart(*output, phi, metadata, initial_action);
+}
 
-    const PhiSummary initial_phi = SummarizePhi(phi);
-    if (output == nullptr) {
-        return;
-    }
-
-    *output << "{\"event\":\"run_start\""
-            << ",\"n_cell\":" << metadata.n_cell
-            << ",\"max_grid_size\":" << metadata.max_grid_size
-            << ",\"nsteps\":" << metadata.nsteps
-            << ",\"dt\":" << metadata.dt
-            << ",\"adapt_dt\":" << (metadata.adapt_dt ? "true" : "false")
-            << ",\"advCoeffx\":" << metadata.advCoeffx
-            << ",\"advCoeffy\":" << metadata.advCoeffy
-            << ",\"diffCoeffx\":" << metadata.diffCoeffx
-            << ",\"diffCoeffy\":" << metadata.diffCoeffy
-            << ",\"initial_nlscoef\":" << initial_action.nlscoef
-            << ",\"initial_max_nonlinear_iters\":"
-            << initial_action.max_nonlinear_iters
-            << ",\"initial_eps_lin\":" << initial_action.eps_lin
-            << ",\"initial_lsetup_frequency\":"
-            << initial_action.lsetup_frequency
-            << ",\"initial_jac_eval_frequency\":"
-            << initial_action.jac_eval_frequency
-            << ",\"schedule\":\"" << JsonEscape(metadata.schedule_path) << "\""
-            << ",\"phi_initial\":";
-    WritePhiSummary(*output, initial_phi);
-    *output << "}\n";
+inline void WriteControlRequest (std::ostream& output, int step, amrex::Real time_start,
+                                 amrex::Real time_target, amrex::Real dt,
+                                 const Action& current_action,
+                                 const StepSnapshot& snapshot,
+                                 const RunMetadata& metadata)
+{
+    output << "{\"event\":\"control_request\""
+           << ",\"step\":" << step
+           << ",\"time_start\":" << time_start
+           << ",\"time_target\":" << time_target
+           << ",\"dt\":" << dt
+           << ",\"n_cell\":" << metadata.n_cell
+           << ",\"max_grid_size\":" << metadata.max_grid_size
+           << ",\"nsteps\":" << metadata.nsteps
+           << ",\"adapt_dt\":" << (metadata.adapt_dt ? "true" : "false")
+           << ",\"advCoeffx\":" << metadata.advCoeffx
+           << ",\"advCoeffy\":" << metadata.advCoeffy
+           << ",\"diffCoeffx\":" << metadata.diffCoeffx
+           << ",\"diffCoeffy\":" << metadata.diffCoeffy
+           << ",\"current_action\":";
+    WriteAction(output, current_action);
+    output << ",\"phi\":";
+    WritePhiSummary(output, snapshot.phi);
+    output << ",\"sundials\":";
+    WriteSundialsStats(output, snapshot.sundials);
+    output << ",\"mlmg\":";
+    WriteMlmgTelemetry(output, snapshot.mlmg);
+    output << "}\n";
 }
 
 inline void WriteTransition (std::ostream& output, int step, amrex::Real time_start,
@@ -357,14 +495,9 @@ inline void WriteTransition (std::ostream& output, int step, amrex::Real time_st
            << ",\"time_start\":" << time_start
            << ",\"time_target\":" << time_target
            << ",\"dt\":" << dt
-           << ",\"action\":{\"nlscoef\":" << action.nlscoef
-           << ",\"max_nonlinear_iters\":"
-           << action.max_nonlinear_iters
-           << ",\"eps_lin\":" << action.eps_lin
-           << ",\"lsetup_frequency\":"
-           << action.lsetup_frequency
-           << ",\"jac_eval_frequency\":"
-           << action.jac_eval_frequency << "}"
+           << ",\"action\":";
+    WriteAction(output, action);
+    output
            << ",\"reward\":" << -step_wall_seconds
            << ",\"evolve_wall_seconds\":" << step_wall_seconds
            << ",\"valid\":" << (step_valid ? "true" : "false")
@@ -395,28 +528,41 @@ inline bool RecordTransition (std::ostream* output, int step, amrex::Real time_s
     return StepIsValid(after);
 }
 
+inline bool WriteRunEnd (std::ostream& output, const amrex::MultiFab& phi, int completed_steps,
+                         int requested_steps, bool episode_valid,
+                         amrex::Real evolution_wall_seconds, amrex::Real l1_error,
+                         const MlmgTelemetry& mlmg)
+{
+    const PhiSummary final_phi = SummarizePhi(phi);
+    const bool valid = episode_valid && final_phi.finite && std::isfinite(l1_error);
+
+    output << "{\"event\":\"run_end\""
+           << ",\"completed_steps\":" << completed_steps
+           << ",\"requested_steps\":" << requested_steps
+           << ",\"valid\":" << (valid ? "true" : "false")
+           << ",\"total_evolution_time\":" << evolution_wall_seconds
+           << ",\"l1_error\":" << l1_error
+           << ",\"mlmg_total\":";
+    WriteMlmgTelemetry(output, mlmg);
+    output << ",\"phi_final\":";
+    WritePhiSummary(output, final_phi);
+    output << "}\n";
+
+    return valid;
+}
+
 inline bool RecordRunEnd (std::ostream* output, const amrex::MultiFab& phi, int completed_steps,
                           int requested_steps, bool episode_valid,
                           amrex::Real evolution_wall_seconds, amrex::Real l1_error,
                           const MlmgTelemetry& mlmg)
 {
-    const PhiSummary final_phi = SummarizePhi(phi);
-    const bool valid = episode_valid && final_phi.finite && std::isfinite(l1_error);
-
     if (output != nullptr) {
-        *output << "{\"event\":\"run_end\""
-                << ",\"completed_steps\":" << completed_steps
-                << ",\"requested_steps\":" << requested_steps
-                << ",\"valid\":" << (valid ? "true" : "false")
-                << ",\"total_evolution_time\":" << evolution_wall_seconds
-                << ",\"l1_error\":" << l1_error
-                << ",\"mlmg_total\":";
-        WriteMlmgTelemetry(*output, mlmg);
-        *output << ",\"phi_final\":";
-        WritePhiSummary(*output, final_phi);
-        *output << "}\n";
+        return WriteRunEnd(*output, phi, completed_steps, requested_steps,
+                           episode_valid, evolution_wall_seconds, l1_error, mlmg);
     }
 
+    const PhiSummary final_phi = SummarizePhi(phi);
+    const bool valid = episode_valid && final_phi.finite && std::isfinite(l1_error);
     return valid;
 }
 

@@ -52,6 +52,8 @@ integration.sundials.max_linear_iters = 20
 # rl_data.enabled = 0
 # rl_data.output = advdiff_mlmg_rl_data.jsonl
 # rl_data.skip_final_plotfiles = 0
+# rl_control.mode = schedule
+# rl_control.mode = stdin_json
 # rl_control.schedule = schedule.csv
 
 # MLMG settings for the SUNDIALS preconditioner solve

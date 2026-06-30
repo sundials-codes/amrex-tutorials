@@ -85,6 +85,7 @@ void main_main ()
     bool rl_skip_final_plotfiles = false;
     std::string rl_output_path = "advdiff_mlmg_rl_data.jsonl";
     std::string rl_schedule_path;
+    std::string rl_control_mode = "schedule";
     rl::Action rl_current_action;
 
     // inputs parameters
@@ -152,12 +153,21 @@ void main_main ()
 
         ParmParse pp_rl_control("rl_control");
         pp_rl_control.query("schedule", rl_schedule_path);
+        pp_rl_control.query("mode", rl_control_mode);
 
 #ifndef AMREX_USE_HYPRE
         if (mlmg_use_hypre) {
             amrex::Abort("mlmg.use_hypre requires AMReX to be built with HYPRE support");
         }
 #endif
+    }
+
+    const bool rl_stdin_json_control = (rl_control_mode == "stdin_json");
+    if (rl_control_mode != "schedule" && rl_control_mode != "stdin_json") {
+        amrex::Abort("rl_control.mode must be 'schedule' or 'stdin_json'");
+    }
+    if (rl_stdin_json_control && !rl_schedule_path.empty()) {
+        amrex::Abort("rl_control.schedule cannot be combined with rl_control.mode=stdin_json");
     }
 
     const auto rl_schedule = rl::LoadSchedule(rl_schedule_path);
@@ -387,16 +397,42 @@ void main_main ()
 
     const rl::RunMetadata rl_metadata{n_cell, max_grid_size, nsteps, dt, adapt_dt,
                                       advCoeffx, advCoeffy, diffCoeffx, diffCoeffy,
-                                      rl_schedule_path};
+                                      rl_schedule_path, rl_control_mode};
     rl::RecordRunStart(rl_output.get(), phi, rl_metadata, rl_current_action, rl_data_enabled);
+    if (rl_stdin_json_control && amrex::ParallelDescriptor::IOProcessor()) {
+        std::cout.setf(std::ios::scientific);
+        std::cout << std::setprecision(17);
+        rl::WriteRunStart(std::cout, phi, rl_metadata, rl_current_action);
+        std::cout.flush();
+    }
 
     Real evolution_start_time = ParallelDescriptor::second();
     int completed_steps = 0;
     bool episode_valid = true;
+    const bool rl_capture_enabled = rl_data_enabled || rl_stdin_json_control;
 
     for (int step = 1; step <= nsteps; ++step)
     {
-        rl::ApplyScheduledAction(rl_schedule, rl_next_schedule, step, rl_current_action);
+        // Set time to evolve to
+        const Real time_start = time;
+        const Real time_target = time_start + dt;
+
+        rl::StepSnapshot rl_before;
+        if (rl_capture_enabled) {
+            rl_before = rl::CaptureStepSnapshot(phi, integrator.get_sundials_stats(),
+                                                mlmg_telemetry);
+        }
+
+        if (rl_stdin_json_control) {
+            if (amrex::ParallelDescriptor::IOProcessor()) {
+                rl::WriteControlRequest(std::cout, step, time_start, time_target, dt,
+                                        rl_current_action, rl_before, rl_metadata);
+                std::cout.flush();
+            }
+            rl::ReadJsonActionFromStdin(step, rl_current_action);
+        } else {
+            rl::ApplyScheduledAction(rl_schedule, rl_next_schedule, step, rl_current_action);
+        }
 
         if (integrator.supports_sundials_controls()) {
             integrator.set_sundials_nonlinear_control(
@@ -407,16 +443,7 @@ void main_main ()
                  rl_current_action.jac_eval_frequency});
         }
 
-        // Set time to evolve to
-        const Real time_start = time;
-        time += dt;
-
-        rl::StepSnapshot rl_before;
-        if (rl_data_enabled) {
-            rl_before = rl::CaptureStepSnapshot(phi, integrator.get_sundials_stats(),
-                                                mlmg_telemetry);
-        }
-
+        time = time_target;
         Real step_start_time = ParallelDescriptor::second();
 
         // Advance to output time
@@ -428,12 +455,20 @@ void main_main ()
         // Tell the I/O Processor to write out which step we're doing
         amrex::Print() << "Advanced step " << step << " in " << step_stop_time << " seconds; dt = " << dt << " time = " << time << "\n";
 
-        if (rl_data_enabled) {
+        if (rl_capture_enabled) {
             const auto rl_after = rl::CaptureStepSnapshot(phi, integrator.get_sundials_stats(),
                                                           mlmg_telemetry);
-            const bool step_valid = rl::RecordTransition(
-                rl_output.get(), step, time_start, time, dt, rl_current_action, step_stop_time,
-                rl_before, rl_after);
+            bool step_valid = rl::StepIsValid(rl_after);
+            if (rl_data_enabled) {
+                step_valid = rl::RecordTransition(
+                    rl_output.get(), step, time_start, time, dt, rl_current_action,
+                    step_stop_time, rl_before, rl_after);
+            }
+            if (rl_stdin_json_control && amrex::ParallelDescriptor::IOProcessor()) {
+                rl::WriteTransition(std::cout, step, time_start, time, dt,
+                                    rl_current_action, step_stop_time, rl_before, rl_after);
+                std::cout.flush();
+            }
             episode_valid = episode_valid && step_valid;
 
             if (!step_valid) {
@@ -492,6 +527,12 @@ void main_main ()
         episode_valid = rl::RecordRunEnd(rl_output.get(), phi, completed_steps, nsteps,
                                          episode_valid, evolution_stop_time, error,
                                          mlmg_telemetry);
+    }
+    if (rl_stdin_json_control && amrex::ParallelDescriptor::IOProcessor()) {
+        episode_valid = rl::WriteRunEnd(std::cout, phi, completed_steps, nsteps,
+                                        episode_valid, evolution_stop_time, error,
+                                        mlmg_telemetry);
+        std::cout.flush();
     }
 }
 
