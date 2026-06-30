@@ -297,6 +297,26 @@ void main_main ()
         mlmg_gamma = gamma;
     };
 
+    auto gamma_has_changed = [&] (Real gamma)
+    {
+        if (!std::isfinite(mlmg_gamma)) {
+            return true;
+        }
+        const Real scale = std::max({Real(1.0), std::abs(gamma), std::abs(mlmg_gamma)});
+        return std::abs(gamma - mlmg_gamma) >
+               Real(10.0) * std::numeric_limits<Real>::epsilon() * scale;
+    };
+
+    auto update_mlmg_gamma = [&](MLMGPreconditioner& preconditioner, Real gamma)
+    {
+        for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+            const Real diff_coeff = (idim == 0) ? diffCoeffx : ((idim == 1) ? diffCoeffy : 0.0);
+            preconditioner.face_bcoef[idim].setVal(gamma * diff_coeff);
+        }
+        preconditioner.linop->setBCoeffs(0, amrex::GetArrOfConstPtrs(preconditioner.face_bcoef));
+        mlmg_gamma = gamma;
+    };
+
     auto build_mlmg_preconditioner = [&](Real gamma)
     {
         auto preconditioner = std::make_unique<MLMGPreconditioner>();
