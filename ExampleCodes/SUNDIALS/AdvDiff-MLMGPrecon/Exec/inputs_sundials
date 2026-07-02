@@ -64,6 +64,7 @@ mlmg.bottom_verbose = 0
 mlmg.use_hypre = 1
 mlmg.hypre_interface = 1  # 1 = structed, 2 = semi_structed, 3 = ij
 mlmg.hypre_options_namespace = hypre
+mlmg.mlmg_max_coarsening_level = 0 # set to 0 to use hypre on all levels
 mlmg.reltol = 1.e-10
 mlmg.abstol = 0.0
 
