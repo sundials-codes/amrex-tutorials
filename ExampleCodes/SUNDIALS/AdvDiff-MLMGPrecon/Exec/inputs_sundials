@@ -1,15 +1,15 @@
-n_cell = 256
-max_grid_size = 256
-
-dt = 1.e-4
-nsteps = 10
-plot_int = 100
+n_cell = 128
+max_grid_size = 128
 
 advCoeffx = 100.
 advCoeffy = 100.
 
-diffCoeffx = 100.
-diffCoeffy = 100.
+diffCoeffx = 10000.
+diffCoeffy = 10000.
+
+dt = 1.e-4  # when adapt_dt = true, this is just used to set output interval only
+nsteps = 10
+plot_int = 100
 
 # Use adaptive time stepping (multi-stage integrators only!) and set integrator relative and absolute tolerances
 adapt_dt = true
@@ -36,8 +36,8 @@ integration.type = SUNDIALS
 # Optionally select a specific SUNDIALS method by name, see the SUNDIALS
 # documentation for the supported method names
 integration.sundials.type = IMEX-RK
-integration.sundials.method_i = ARKODE_ARK2_DIRK_3_1_2
-integration.sundials.method_e = ARKODE_ARK2_ERK_3_1_2
+integration.sundials.method_i = ARKODE_ARK437L2SA_DIRK_7_3_4 # ARKODE_ARK2_DIRK_3_1_2
+integration.sundials.method_e = ARKODE_ARK437L2SA_ERK_7_3_4  # ARKODE_ARK2_ERK_3_1_2
 integration.sundials.linear_solver = GMRES
 integration.sundials.linear_solver_preconditioning = LEFT
 integration.sundials.max_linear_iters = 20
@@ -61,13 +61,16 @@ mlmg.max_iter = 100
 mlmg.max_fmg_iter = 0
 mlmg.verbose = 0
 mlmg.bottom_verbose = 0
-mlmg.use_hypre = 1
-mlmg.hypre_interface = 1  # 1 = structed, 2 = semi_structed, 3 = ij
-mlmg.hypre_options_namespace = hypre
-mlmg.mlmg_max_coarsening_level = 0 # set to 0 to use hypre on all levels
-mlmg.reltol = 1.e-10
+mlmg.reltol = 1.e-4
 mlmg.abstol = 0.0
+mlmg.max_coarsening_level = 0 # set to 0 to use hypre on all levels
+mlmg.use_hypre = 1
+mlmg.hypre_interface = 3  # 1 = structed, 2 = semi_structed, 3 = ij
+mlmg.hypre_options_namespace = hypre
 
 # HYPRE settings used when mlmg.use_hypre = 1 and mlmg.hypre_interface = 3
 hypre.hypre_solver = BoomerAMG
-hypre.write_matrix_files = True
+hypre.recompute_preconditioner = false
+hypre.verbose = 0
+hypre.logging = 0
+hypre.write_matrix_files = false
