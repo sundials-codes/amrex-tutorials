@@ -1,0 +1,21 @@
+Refer to https://amrex-codes.github.io/amrex/docs_html/TimeIntegration_Chapter.html
+for SUNDIALS installation, build, and usage instructions.
+
+Make sure that SUNDIALS_HOME in the GNUmakefile points to the installation directory.
+This tutorial also requires AMReX to be built with MLMG linear solver support.
+The default inputs use a SUNDIALS IMEX-RK method with GMRES and an AMReX MLMG
+preconditioner for the implicit diffusion solve.
+
+This variant uses piecewise-constant time-dependent diffusion coefficients.
+The base coefficients are diffCoeffx and diffCoeffy; active values are
+base coefficient times the current diffusion.x_multipliers or
+diffusion.y_multipliers entry. The schedule in inputs_sundials switches from
+base diffusion to 4x diffusion at t=0.03, then back to base diffusion at t=0.06.
+
+Because the analytic Gaussian comparison from the constant-diffusion tutorial is
+not valid here, use scripts/run-advdiff-time-dependent-diffusion-reference.sh
+from the AI_STEERING workspace for coarse/refined plotfile comparison.
+
+Set USE_HYPRE=TRUE when building and mlmg.use_hypre=1 in inputs_sundials to use
+MLMG's HYPRE bottom solver interface. The HYPRE interface and options namespace
+are controlled by mlmg.hypre_interface and mlmg.hypre_options_namespace.
