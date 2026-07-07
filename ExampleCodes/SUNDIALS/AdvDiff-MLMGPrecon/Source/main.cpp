@@ -48,14 +48,14 @@ void main_main ()
     // size of each box (or grid)
     int max_grid_size;
 
-    // total steps in simulation
-    int nsteps;
-
     // how often to write a plotfile
     int plot_int;
 
     // time step
     Real dt;
+
+    // final simulation time
+    Real final_time;
 
     // use adaptive time step (dt used to set output times)
     bool adapt_dt = false;
@@ -87,6 +87,7 @@ void main_main ()
     std::string rl_output_path = "advdiff_mlmg_rl_data.jsonl";
     std::string rl_schedule_path;
     std::string rl_control_mode = "schedule";
+    int rl_max_agent_steps = 100000;
     rl::Action rl_current_action;
 
     // inputs parameters
@@ -103,10 +104,6 @@ void main_main ()
         // The domain is broken into boxes of size max_grid_size
         pp.get("max_grid_size",max_grid_size);
 
-        // Default nsteps to 10, allow us to set it to something else in the inputs file
-        nsteps = 10;
-        pp.query("nsteps",nsteps);
-
         // Default plot_int to -1, allow us to set it to something else in the inputs file
         //  If plot_int < 0 then no plot files will be written
         plot_int = -1;
@@ -114,6 +111,11 @@ void main_main ()
 
         // time step
         pp.get("dt",dt);
+
+        pp.get("final_time",final_time);
+        if (!(std::isfinite(final_time) && final_time > Real(0.0))) {
+            amrex::Abort("final_time must be positive and finite");
+        }
 
         // use adaptive step sizes
         pp.query("adapt_dt",adapt_dt);
@@ -156,6 +158,10 @@ void main_main ()
         ParmParse pp_rl_control("rl_control");
         pp_rl_control.query("schedule", rl_schedule_path);
         pp_rl_control.query("mode", rl_control_mode);
+        pp_rl_control.query("max_agent_steps", rl_max_agent_steps);
+        if (rl_max_agent_steps <= 0) {
+            amrex::Abort("rl_control.max_agent_steps must be positive");
+        }
 
 #ifndef AMREX_USE_HYPRE
         if (mlmg_use_hypre) {
@@ -165,6 +171,7 @@ void main_main ()
     }
 
     const bool rl_stdin_json_control = (rl_control_mode == "stdin_json");
+    const bool rl_step_control = rl_stdin_json_control || rl_data_enabled || !rl_schedule_path.empty();
     if (rl_control_mode != "schedule" && rl_control_mode != "stdin_json") {
         amrex::Abort("rl_control.mode must be 'schedule' or 'stdin_json'");
     }
@@ -399,7 +406,17 @@ void main_main ()
         integrator.set_time_step(dt);
     }
 
-    const rl::RunMetadata rl_metadata{n_cell, max_grid_size, nsteps, dt, adapt_dt,
+    if (integrator.supports_sundials_controls()) {
+        integrator.set_sundials_nonlinear_control(
+            {rl_current_action.nlscoef,
+             rl_current_action.max_nonlinear_iters,
+             rl_current_action.eps_lin,
+             rl_current_action.lsetup_frequency,
+             rl_current_action.jac_eval_frequency});
+    }
+
+    const rl::RunMetadata rl_metadata{n_cell, max_grid_size, rl_max_agent_steps,
+                                      final_time, dt, adapt_dt,
                                       advCoeffx, advCoeffy, diffCoeffx, diffCoeffy,
                                       rl_schedule_path, rl_control_mode};
     rl::RecordRunStart(rl_output.get(), phi, rl_metadata, rl_current_action, rl_data_enabled);
@@ -414,83 +431,135 @@ void main_main ()
     int completed_steps = 0;
     bool episode_valid = true;
     const bool rl_capture_enabled = rl_data_enabled || rl_stdin_json_control;
-
-    for (int step = 1; step <= nsteps; ++step)
+    auto time_is_before = [] (Real lhs, Real rhs)
     {
-        // Set time to evolve to
-        const Real time_start = time;
-        const Real time_target = time_start + dt;
+        const Real scale = std::max({Real(1.0), std::abs(lhs), std::abs(rhs)});
+        return lhs < rhs - Real(100.0) * std::numeric_limits<Real>::epsilon() * scale;
+    };
 
-        rl::StepSnapshot rl_before;
-        if (rl_capture_enabled) {
-            rl_before = rl::CaptureStepSnapshot(phi, integrator.get_sundials_stats(),
-                                                mlmg_telemetry);
-        }
-
-        if (rl_stdin_json_control) {
-            if (amrex::ParallelDescriptor::IOProcessor()) {
-                rl::WriteControlRequest(std::cout, step, time_start, time_target, dt,
-                                        rl_current_action, rl_before, rl_metadata);
-                std::cout.flush();
-            }
-            rl::ReadJsonActionFromStdin(step, rl_current_action);
-        } else {
-            rl::ApplyScheduledAction(rl_schedule, rl_next_schedule, step, rl_current_action);
-        }
-
-        if (integrator.supports_sundials_controls()) {
-            integrator.set_sundials_nonlinear_control(
-                {rl_current_action.nlscoef,
-                 rl_current_action.max_nonlinear_iters,
-                 rl_current_action.eps_lin,
-                 rl_current_action.lsetup_frequency,
-                 rl_current_action.jac_eval_frequency});
-        }
-
-        time = time_target;
-        Real step_start_time = ParallelDescriptor::second();
-
-        // Advance to output time
-        integrator.evolve(phi, time);
-
-        Real step_stop_time = ParallelDescriptor::second() - step_start_time;
-        ParallelDescriptor::ReduceRealMax(step_stop_time);
-
-        // Tell the I/O Processor to write out which step we're doing
-        amrex::Print() << "Advanced step " << step << " in " << step_stop_time << " seconds; dt = " << dt << " time = " << time << "\n";
-
-        if (rl_capture_enabled) {
-            const auto rl_after = rl::CaptureStepSnapshot(phi, integrator.get_sundials_stats(),
-                                                          mlmg_telemetry);
-            bool step_valid = rl::StepIsValid(rl_after);
-            if (rl_data_enabled) {
-                step_valid = rl::RecordTransition(
-                    rl_output.get(), step, time_start, time, dt, rl_current_action,
-                    step_stop_time, rl_before, rl_after);
-            }
-            if (rl_stdin_json_control && amrex::ParallelDescriptor::IOProcessor()) {
-                rl::WriteTransition(std::cout, step, time_start, time, dt,
-                                    rl_current_action, step_stop_time, rl_before, rl_after);
-                std::cout.flush();
-            }
-            episode_valid = episode_valid && step_valid;
-
-            if (!step_valid) {
-                amrex::Print() << "Stopping after invalid RL data step " << step
-                               << "; SUNDIALS flag = " << rl_after.sundials.last_flag
-                               << ", finite phi = " << (rl_after.phi.finite ? "true" : "false")
-                               << "\n";
+    if (rl_step_control) {
+        for (int control_step = 1; time_is_before(time, final_time); ++control_step)
+        {
+            if (control_step > rl_max_agent_steps) {
+                amrex::Print() << "Stopping after reaching rl_control.max_agent_steps = "
+                               << rl_max_agent_steps << "\n";
+                episode_valid = false;
                 break;
             }
+
+            const Real time_start = time;
+            const Real time_limit = final_time;
+            const auto stats_before = integrator.get_sundials_stats();
+            const Real remaining = time_limit - time_start;
+            Real dt_proposed = remaining;
+            if (stats_before.valid && stats_before.hcur > Real(0.0)) {
+                dt_proposed = std::min(stats_before.hcur, remaining);
+            } else if (dt > Real(0.0)) {
+                dt_proposed = std::min(dt, remaining);
+            }
+
+            rl::StepSnapshot rl_before;
+            if (rl_capture_enabled) {
+                rl_before = rl::CaptureStepSnapshot(phi, stats_before, mlmg_telemetry);
+            }
+
+            if (rl_stdin_json_control) {
+                if (amrex::ParallelDescriptor::IOProcessor()) {
+                    rl::WriteControlRequest(std::cout, control_step, time_start, time_limit,
+                                            dt_proposed, rl_current_action, rl_before,
+                                            rl_metadata);
+                    std::cout.flush();
+                }
+                rl::ReadJsonActionFromStdin(control_step, rl_current_action);
+            } else {
+                rl::ApplyScheduledAction(rl_schedule, rl_next_schedule, control_step,
+                                         rl_current_action);
+            }
+
+            if (integrator.supports_sundials_controls()) {
+                integrator.set_sundials_nonlinear_control(
+                    {rl_current_action.nlscoef,
+                     rl_current_action.max_nonlinear_iters,
+                     rl_current_action.eps_lin,
+                     rl_current_action.lsetup_frequency,
+                     rl_current_action.jac_eval_frequency});
+            }
+
+            Real step_start_time = ParallelDescriptor::second();
+            const Real time_after = integrator.evolve_one_step(phi, time_limit);
+            Real step_stop_time = ParallelDescriptor::second() - step_start_time;
+            ParallelDescriptor::ReduceRealMax(step_stop_time);
+
+            time = time_after;
+            const Real dt_actual = time_after - time_start;
+
+            amrex::Print() << "Advanced control step " << control_step
+                           << " in " << step_stop_time
+                           << " seconds; dt_actual = " << dt_actual
+                           << " time = " << time << "\n";
+
+            if (rl_capture_enabled) {
+                const auto rl_after = rl::CaptureStepSnapshot(phi, integrator.get_sundials_stats(),
+                                                              mlmg_telemetry);
+                bool step_valid = rl::StepIsValid(rl_after) && dt_actual >= Real(0.0);
+                if (rl_data_enabled) {
+                    step_valid = rl::RecordTransition(
+                        rl_output.get(), control_step, time_start, time_limit, time_after,
+                        dt_actual, rl_current_action, step_stop_time, rl_before, rl_after,
+                        rl_metadata) && step_valid;
+                }
+                if (rl_stdin_json_control && amrex::ParallelDescriptor::IOProcessor()) {
+                    rl::WriteTransition(std::cout, control_step, time_start, time_limit,
+                                        time_after, dt_actual, rl_current_action,
+                                        step_stop_time, rl_before, rl_after, rl_metadata);
+                    std::cout.flush();
+                }
+                episode_valid = episode_valid && step_valid;
+
+                if (!step_valid) {
+                    amrex::Print() << "Stopping after invalid RL data control step "
+                                   << control_step
+                                   << "; SUNDIALS flag = " << rl_after.sundials.last_flag
+                                   << ", finite phi = "
+                                   << (rl_after.phi.finite ? "true" : "false")
+                                   << "\n";
+                    break;
+                }
+            }
+
+            completed_steps = control_step;
+
+            if (!(dt_actual > Real(0.0)) && time_is_before(time, final_time)) {
+                amrex::Print() << "Stopping after non-advancing ARKODE one-step return\n";
+                episode_valid = false;
+                break;
+            }
+
+            if (plot_int > 0 && control_step%plot_int == 0)
+            {
+                const std::string& pltfile = amrex::Concatenate("plt",control_step,5);
+                WriteSingleLevelPlotfile(pltfile, phi, {"phi"}, geom, time, control_step);
+            }
         }
-
-        completed_steps = step;
-
-        // Write a plotfile of the current data (plot_int was defined in the inputs file)
-        if (plot_int > 0 && step%plot_int == 0)
+    } else {
+        for (int output_step = 1; time_is_before(time, final_time); ++output_step)
         {
-            const std::string& pltfile = amrex::Concatenate("plt",step,5);
-            WriteSingleLevelPlotfile(pltfile, phi, {"phi"}, geom, time, step);
+            time = std::min(time + dt, final_time);
+            Real step_start_time = ParallelDescriptor::second();
+            integrator.evolve(phi, time);
+            Real step_stop_time = ParallelDescriptor::second() - step_start_time;
+            ParallelDescriptor::ReduceRealMax(step_stop_time);
+
+            amrex::Print() << "Advanced output step " << output_step
+                           << " in " << step_stop_time
+                           << " seconds; time = " << time << "\n";
+            completed_steps = output_step;
+
+            if (plot_int > 0 && output_step%plot_int == 0)
+            {
+                const std::string& pltfile = amrex::Concatenate("plt",output_step,5);
+                WriteSingleLevelPlotfile(pltfile, phi, {"phi"}, geom, time, output_step);
+            }
         }
     }
 
@@ -506,9 +575,9 @@ void main_main ()
     phi_exact.SumBoundary(geom.periodicity());
 
     {
-        const std::string& pltfile = amrex::Concatenate("exact",nsteps,5);
+        const std::string& pltfile = amrex::Concatenate("exact",completed_steps,5);
         if (!rl_skip_final_plotfiles) {
-            WriteSingleLevelPlotfile(pltfile, phi_exact, {"phi"}, geom, time, nsteps);
+            WriteSingleLevelPlotfile(pltfile, phi_exact, {"phi"}, geom, time, completed_steps);
         }
     }
 
@@ -518,9 +587,9 @@ void main_main ()
     MultiFab::Subtract(phi_exact_dist,phi,0,0,1,0);
 
     {
-        const std::string& pltfile = amrex::Concatenate("diff",nsteps,5);
+        const std::string& pltfile = amrex::Concatenate("diff",completed_steps,5);
         if (!rl_skip_final_plotfiles) {
-            WriteSingleLevelPlotfile(pltfile, phi_exact_dist, {"phi"}, geom, time, nsteps);
+            WriteSingleLevelPlotfile(pltfile, phi_exact_dist, {"phi"}, geom, time, completed_steps);
         }
     }
 
@@ -528,14 +597,14 @@ void main_main ()
     amrex::Print() << "L1 error = " << error << std::endl;
 
     if (rl_data_enabled) {
-        episode_valid = rl::RecordRunEnd(rl_output.get(), phi, completed_steps, nsteps,
-                                         episode_valid, evolution_stop_time, error,
-                                         mlmg_telemetry);
+        episode_valid = rl::RecordRunEnd(rl_output.get(), phi, completed_steps,
+                                         episode_valid, time, evolution_stop_time, error,
+                                         mlmg_telemetry, rl_metadata);
     }
     if (rl_stdin_json_control && amrex::ParallelDescriptor::IOProcessor()) {
-        episode_valid = rl::WriteRunEnd(std::cout, phi, completed_steps, nsteps,
-                                        episode_valid, evolution_stop_time, error,
-                                        mlmg_telemetry);
+        episode_valid = rl::WriteRunEnd(std::cout, phi, completed_steps,
+                                        episode_valid, time, evolution_stop_time, error,
+                                        mlmg_telemetry, rl_metadata);
         std::cout.flush();
     }
 }

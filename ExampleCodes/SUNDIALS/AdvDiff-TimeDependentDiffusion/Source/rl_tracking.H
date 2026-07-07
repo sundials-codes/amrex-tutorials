@@ -59,8 +59,9 @@ struct StepSnapshot {
 struct RunMetadata {
     int n_cell = 0;
     int max_grid_size = 0;
-    int nsteps = 0;
-    amrex::Real dt = amrex::Real(0.0);
+    int max_agent_steps = 0;
+    amrex::Real final_time = amrex::Real(0.0);
+    amrex::Real dt_nominal = amrex::Real(0.0);
     bool adapt_dt = false;
     amrex::Real advCoeffx = amrex::Real(0.0);
     amrex::Real advCoeffy = amrex::Real(0.0);
@@ -129,10 +130,10 @@ inline std::vector<Action> LoadSchedule (const std::string& path)
             fields.push_back(Trim(field));
         }
 
-        if (fields.size() != 3 && fields.size() != 5 && fields.size() != 6) {
+        if (fields.size() != 6) {
             amrex::Abort("Bad rl_control.schedule line " + std::to_string(line_number) +
-                         ": expected step,nlscoef,max_nonlinear_iters"
-                         "[,eps_lin,lsetup_frequency[,jac_eval_frequency]]");
+                         ": expected step,nlscoef,max_nonlinear_iters,"
+                         "eps_lin,lsetup_frequency,jac_eval_frequency");
         }
 
         if (fields[0].empty() ||
@@ -145,13 +146,9 @@ inline std::vector<Action> LoadSchedule (const std::string& path)
         action.step = std::stoi(fields[0]);
         action.nlscoef = static_cast<amrex::Real>(std::stod(fields[1]));
         action.max_nonlinear_iters = std::stoi(fields[2]);
-        if (fields.size() >= 5) {
-            action.eps_lin = static_cast<amrex::Real>(std::stod(fields[3]));
-            action.lsetup_frequency = std::stoi(fields[4]);
-        }
-        if (fields.size() == 6) {
-            action.jac_eval_frequency = std::stol(fields[5]);
-        }
+        action.eps_lin = static_cast<amrex::Real>(std::stod(fields[3]));
+        action.lsetup_frequency = std::stoi(fields[4]);
+        action.jac_eval_frequency = std::stol(fields[5]);
         schedule.push_back(action);
     }
 
@@ -161,9 +158,9 @@ inline std::vector<Action> LoadSchedule (const std::string& path)
 }
 
 inline void ApplyScheduledAction (const std::vector<Action>& schedule, std::size_t& next_schedule,
-                                  int step, Action& action)
+                                  int control_step, Action& action)
 {
-    while (next_schedule < schedule.size() && schedule[next_schedule].step <= step) {
+    while (next_schedule < schedule.size() && schedule[next_schedule].step <= control_step) {
         action = schedule[next_schedule];
         ++next_schedule;
     }
@@ -434,8 +431,9 @@ inline void WriteRunStart (std::ostream& output, const amrex::MultiFab& phi,
     output << "{\"event\":\"run_start\""
            << ",\"n_cell\":" << metadata.n_cell
            << ",\"max_grid_size\":" << metadata.max_grid_size
-           << ",\"nsteps\":" << metadata.nsteps
-           << ",\"dt\":" << metadata.dt
+           << ",\"max_agent_steps\":" << metadata.max_agent_steps
+           << ",\"final_time\":" << metadata.final_time
+           << ",\"dt_nominal\":" << metadata.dt_nominal
            << ",\"adapt_dt\":" << (metadata.adapt_dt ? "true" : "false")
            << ",\"advCoeffx\":" << metadata.advCoeffx
            << ",\"advCoeffy\":" << metadata.advCoeffy
@@ -473,20 +471,22 @@ inline void RecordRunStart (std::ostream* output, const amrex::MultiFab& phi,
     WriteRunStart(*output, phi, metadata, initial_action);
 }
 
-inline void WriteControlRequest (std::ostream& output, int step, amrex::Real time_start,
-                                 amrex::Real time_target, amrex::Real dt,
+inline void WriteControlRequest (std::ostream& output, int control_step,
+                                 amrex::Real time_start, amrex::Real time_limit,
+                                 amrex::Real dt_proposed,
                                  const Action& current_action,
                                  const StepSnapshot& snapshot,
                                  const RunMetadata& metadata)
 {
     output << "{\"event\":\"control_request\""
-           << ",\"step\":" << step
+           << ",\"control_step\":" << control_step
            << ",\"time_start\":" << time_start
-           << ",\"time_target\":" << time_target
-           << ",\"dt\":" << dt
+           << ",\"time_limit\":" << time_limit
+           << ",\"dt_proposed\":" << dt_proposed
+           << ",\"final_time\":" << metadata.final_time
            << ",\"n_cell\":" << metadata.n_cell
            << ",\"max_grid_size\":" << metadata.max_grid_size
-           << ",\"nsteps\":" << metadata.nsteps
+           << ",\"max_agent_steps\":" << metadata.max_agent_steps
            << ",\"adapt_dt\":" << (metadata.adapt_dt ? "true" : "false")
            << ",\"advCoeffx\":" << metadata.advCoeffx
            << ",\"advCoeffy\":" << metadata.advCoeffy
@@ -503,20 +503,24 @@ inline void WriteControlRequest (std::ostream& output, int step, amrex::Real tim
     output << "}\n";
 }
 
-inline void WriteTransition (std::ostream& output, int step, amrex::Real time_start,
-                             amrex::Real time_target, amrex::Real dt, const Action& action,
+inline void WriteTransition (std::ostream& output, int control_step,
+                             amrex::Real time_start, amrex::Real time_limit,
+                             amrex::Real time_after, amrex::Real dt_actual,
+                             const Action& action,
                              amrex::Real step_wall_seconds, const StepSnapshot& before,
-                             const StepSnapshot& after)
+                             const StepSnapshot& after, const RunMetadata& metadata)
 {
     const auto sundials_delta = after.sundials - before.sundials;
     const auto mlmg_delta = after.mlmg - before.mlmg;
     const bool step_valid = StepIsValid(after);
 
     output << "{\"event\":\"transition\""
-           << ",\"step\":" << step
+           << ",\"control_step\":" << control_step
            << ",\"time_start\":" << time_start
-           << ",\"time_target\":" << time_target
-           << ",\"dt\":" << dt
+           << ",\"time_limit\":" << time_limit
+           << ",\"time_after\":" << time_after
+           << ",\"dt_actual\":" << dt_actual
+           << ",\"final_time\":" << metadata.final_time
            << ",\"action\":";
     WriteAction(output, action);
     output
@@ -538,29 +542,33 @@ inline void WriteTransition (std::ostream& output, int step, amrex::Real time_st
     output << "}\n";
 }
 
-inline bool RecordTransition (std::ostream* output, int step, amrex::Real time_start,
-                              amrex::Real time_target, amrex::Real dt, const Action& action,
+inline bool RecordTransition (std::ostream* output, int control_step,
+                              amrex::Real time_start, amrex::Real time_limit,
+                              amrex::Real time_after, amrex::Real dt_actual,
+                              const Action& action,
                               amrex::Real step_wall_seconds, const StepSnapshot& before,
-                              const StepSnapshot& after)
+                              const StepSnapshot& after, const RunMetadata& metadata)
 {
     if (output != nullptr) {
-        WriteTransition(*output, step, time_start, time_target, dt, action,
-                        step_wall_seconds, before, after);
+        WriteTransition(*output, control_step, time_start, time_limit, time_after,
+                        dt_actual, action, step_wall_seconds, before, after, metadata);
     }
     return StepIsValid(after);
 }
 
 inline bool WriteRunEnd (std::ostream& output, const amrex::MultiFab& phi, int completed_steps,
-                         int requested_steps, bool episode_valid,
+                         bool episode_valid, amrex::Real time_final,
                          amrex::Real evolution_wall_seconds, amrex::Real analytic_l1_error,
-                         const MlmgTelemetry& mlmg)
+                         const MlmgTelemetry& mlmg, const RunMetadata& metadata)
 {
     const PhiSummary final_phi = SummarizePhi(phi);
     const bool valid = episode_valid && final_phi.finite;
 
     output << "{\"event\":\"run_end\""
            << ",\"completed_steps\":" << completed_steps
-           << ",\"requested_steps\":" << requested_steps
+           << ",\"max_agent_steps\":" << metadata.max_agent_steps
+           << ",\"time_final\":" << time_final
+           << ",\"final_time\":" << metadata.final_time
            << ",\"valid\":" << (valid ? "true" : "false")
            << ",\"total_evolution_time\":" << evolution_wall_seconds
            << ",\"analytic_l1_error\":";
@@ -579,13 +587,13 @@ inline bool WriteRunEnd (std::ostream& output, const amrex::MultiFab& phi, int c
 }
 
 inline bool RecordRunEnd (std::ostream* output, const amrex::MultiFab& phi, int completed_steps,
-                          int requested_steps, bool episode_valid,
+                          bool episode_valid, amrex::Real time_final,
                           amrex::Real evolution_wall_seconds, amrex::Real analytic_l1_error,
-                          const MlmgTelemetry& mlmg)
+                          const MlmgTelemetry& mlmg, const RunMetadata& metadata)
 {
     if (output != nullptr) {
-        return WriteRunEnd(*output, phi, completed_steps, requested_steps,
-                           episode_valid, evolution_wall_seconds, analytic_l1_error, mlmg);
+        return WriteRunEnd(*output, phi, completed_steps, episode_valid, time_final,
+                           evolution_wall_seconds, analytic_l1_error, mlmg, metadata);
     }
 
     const PhiSummary final_phi = SummarizePhi(phi);

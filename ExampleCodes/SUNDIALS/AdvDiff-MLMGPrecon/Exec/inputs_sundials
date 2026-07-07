@@ -7,8 +7,8 @@ advCoeffy = 10.
 diffCoeffx = 100.
 diffCoeffy = 10000.
 
-dt = 1.e-3  # when adapt_dt = true, this is just used to set output interval only
-nsteps = 100
+dt = 1.e-3  # nominal output interval; RL control advances one accepted ARKODE step at a time
+final_time = 0.1
 plot_int = 100
 
 # Use adaptive time stepping (multi-stage integrators only!) and set integrator relative and absolute tolerances
