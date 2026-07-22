@@ -56,6 +56,14 @@ struct StepSnapshot {
     MlmgTelemetry mlmg;
 };
 
+struct ActiveDiffusion {
+    int segment = 0;
+    amrex::Real x_multiplier = amrex::Real(1.0);
+    amrex::Real y_multiplier = amrex::Real(1.0);
+    amrex::Real x = amrex::Real(0.0);
+    amrex::Real y = amrex::Real(0.0);
+};
+
 struct RunMetadata {
     int n_cell = 0;
     int max_grid_size = 0;
@@ -347,6 +355,36 @@ inline StepSnapshot CaptureStepSnapshot (const amrex::MultiFab& phi,
     return {SummarizePhi(phi), sundials, mlmg};
 }
 
+inline ActiveDiffusion ActiveDiffusionAt (const RunMetadata& metadata, amrex::Real time)
+{
+    ActiveDiffusion active;
+    active.x = metadata.diffCoeffx;
+    active.y = metadata.diffCoeffy;
+
+    const auto count = metadata.diffusion_times.size();
+    if (count == 0 || metadata.diffusion_x_multipliers.size() != count ||
+        metadata.diffusion_y_multipliers.size() != count)
+    {
+        return active;
+    }
+
+    int segment = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (time >= metadata.diffusion_times[i]) {
+            segment = static_cast<int>(i);
+        } else {
+            break;
+        }
+    }
+
+    active.segment = segment;
+    active.x_multiplier = metadata.diffusion_x_multipliers[segment];
+    active.y_multiplier = metadata.diffusion_y_multipliers[segment];
+    active.x = metadata.diffCoeffx * active.x_multiplier;
+    active.y = metadata.diffCoeffy * active.y_multiplier;
+    return active;
+}
+
 inline bool StepIsValid (const StepSnapshot& snapshot)
 {
     return snapshot.phi.finite && snapshot.sundials.last_flag >= 0;
@@ -478,6 +516,7 @@ inline void WriteControlRequest (std::ostream& output, int control_step,
                                  const StepSnapshot& snapshot,
                                  const RunMetadata& metadata)
 {
+    const auto active = ActiveDiffusionAt(metadata, time_start);
     output << "{\"event\":\"control_request\""
            << ",\"control_step\":" << control_step
            << ",\"time_start\":" << time_start
@@ -492,6 +531,11 @@ inline void WriteControlRequest (std::ostream& output, int control_step,
            << ",\"advCoeffy\":" << metadata.advCoeffy
            << ",\"diffCoeffx\":" << metadata.diffCoeffx
            << ",\"diffCoeffy\":" << metadata.diffCoeffy
+           << ",\"active_diffusion_segment\":" << active.segment
+           << ",\"active_diffusion_x_multiplier\":" << active.x_multiplier
+           << ",\"active_diffusion_y_multiplier\":" << active.y_multiplier
+           << ",\"active_diffCoeffx\":" << active.x
+           << ",\"active_diffCoeffy\":" << active.y
            << ",\"current_action\":";
     WriteAction(output, current_action);
     output << ",\"phi\":";
@@ -506,6 +550,7 @@ inline void WriteControlRequest (std::ostream& output, int control_step,
 inline void WriteTransition (std::ostream& output, int control_step,
                              amrex::Real time_start, amrex::Real time_limit,
                              amrex::Real time_after, amrex::Real dt_actual,
+                             amrex::Real dt_proposed,
                              const Action& action,
                              amrex::Real step_wall_seconds, const StepSnapshot& before,
                              const StepSnapshot& after, const RunMetadata& metadata)
@@ -513,6 +558,9 @@ inline void WriteTransition (std::ostream& output, int control_step,
     const auto sundials_delta = after.sundials - before.sundials;
     const auto mlmg_delta = after.mlmg - before.mlmg;
     const bool step_valid = StepIsValid(after);
+    const auto active = ActiveDiffusionAt(metadata, time_start);
+    const auto active_after = ActiveDiffusionAt(metadata, time_after);
+    const bool crossed_diffusion_jump = active.segment != active_after.segment;
 
     output << "{\"event\":\"transition\""
            << ",\"control_step\":" << control_step
@@ -520,7 +568,15 @@ inline void WriteTransition (std::ostream& output, int control_step,
            << ",\"time_limit\":" << time_limit
            << ",\"time_after\":" << time_after
            << ",\"dt_actual\":" << dt_actual
+           << ",\"dt_proposed\":" << dt_proposed
            << ",\"final_time\":" << metadata.final_time
+           << ",\"active_diffusion_segment\":" << active.segment
+           << ",\"active_diffusion_x_multiplier\":" << active.x_multiplier
+           << ",\"active_diffusion_y_multiplier\":" << active.y_multiplier
+           << ",\"active_diffCoeffx\":" << active.x
+           << ",\"active_diffCoeffy\":" << active.y
+           << ",\"crossed_diffusion_jump\":"
+           << (crossed_diffusion_jump ? "true" : "false")
            << ",\"action\":";
     WriteAction(output, action);
     output
@@ -545,13 +601,15 @@ inline void WriteTransition (std::ostream& output, int control_step,
 inline bool RecordTransition (std::ostream* output, int control_step,
                               amrex::Real time_start, amrex::Real time_limit,
                               amrex::Real time_after, amrex::Real dt_actual,
+                              amrex::Real dt_proposed,
                               const Action& action,
                               amrex::Real step_wall_seconds, const StepSnapshot& before,
                               const StepSnapshot& after, const RunMetadata& metadata)
 {
     if (output != nullptr) {
         WriteTransition(*output, control_step, time_start, time_limit, time_after,
-                        dt_actual, action, step_wall_seconds, before, after, metadata);
+                        dt_actual, dt_proposed, action, step_wall_seconds, before, after,
+                        metadata);
     }
     return StepIsValid(after);
 }

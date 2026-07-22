@@ -653,12 +653,12 @@ void main_main ()
                 if (rl_data_enabled) {
                     step_valid = rl::RecordTransition(
                         rl_output.get(), control_step, time_start, time_limit, time_after,
-                        dt_actual, rl_current_action, step_stop_time, rl_before, rl_after,
-                        rl_metadata) && step_valid;
+                        dt_actual, dt_proposed, rl_current_action, step_stop_time, rl_before,
+                        rl_after, rl_metadata) && step_valid;
                 }
                 if (rl_stdin_json_control && amrex::ParallelDescriptor::IOProcessor()) {
                     rl::WriteTransition(std::cout, control_step, time_start, time_limit,
-                                        time_after, dt_actual, rl_current_action,
+                                        time_after, dt_actual, dt_proposed, rl_current_action,
                                         step_stop_time, rl_before, rl_after, rl_metadata);
                     std::cout.flush();
                 }

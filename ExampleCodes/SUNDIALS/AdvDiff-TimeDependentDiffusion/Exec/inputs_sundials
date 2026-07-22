@@ -65,8 +65,8 @@ integration.sundials.max_linear_iters = 20
 # MLMG settings for the SUNDIALS preconditioner solve
 mlmg.max_iter = 100
 mlmg.max_fmg_iter = 0
-mlmg.verbose = 0
-mlmg.bottom_verbose = 0
+mlmg.verbose = 1
+mlmg.bottom_verbose = 2
 mlmg.reltol = 1.e-4
 mlmg.abstol = 0.0
 mlmg.max_coarsening_level = 0 # set to 0 to use hypre on all levels
@@ -77,6 +77,6 @@ mlmg.hypre_options_namespace = hypre
 # HYPRE settings used when mlmg.use_hypre = 1 and mlmg.hypre_interface = 3
 hypre.hypre_solver = BoomerAMG
 hypre.recompute_preconditioner = false
-hypre.verbose = 0
-hypre.logging = 0
+hypre.verbose = 2
+hypre.logging = 2
 hypre.write_matrix_files = false
