@@ -6,6 +6,7 @@
 #include <AMReX_MultiFabUtil.H>
 #ifdef AMREX_USE_HYPRE
 #include <AMReX_Hypre.H>
+#include <AMReX_HypreIJIface.H>
 #endif
 
 #include "myfunc.H"
@@ -199,6 +200,8 @@ void main_main ()
     std::string rl_control_mode = "schedule";
     int rl_max_agent_steps = 100000;
     rl::Action rl_current_action;
+    std::string hypre_control_mode = "off";
+    rl::HypreAction hypre_current_action;
 
     // inputs parameters
     {
@@ -290,6 +293,9 @@ void main_main ()
             amrex::Abort("rl_control.max_agent_steps must be positive");
         }
 
+        ParmParse pp_hypre_control("hypre_control");
+        pp_hypre_control.query("mode", hypre_control_mode);
+
 #ifndef AMREX_USE_HYPRE
         if (mlmg_use_hypre) {
             amrex::Abort("mlmg.use_hypre requires AMReX to be built with HYPRE support");
@@ -298,12 +304,21 @@ void main_main ()
     }
 
     const bool rl_stdin_json_control = (rl_control_mode == "stdin_json");
-    const bool rl_step_control = rl_stdin_json_control || rl_data_enabled || !rl_schedule_path.empty();
+    const bool hypre_stdin_json_control = (hypre_control_mode == "stdin_json");
+    const bool protocol_stdout = rl_stdin_json_control || hypre_stdin_json_control;
+    const bool rl_step_control = rl_stdin_json_control || hypre_stdin_json_control ||
+                                 rl_data_enabled || !rl_schedule_path.empty();
     if (rl_control_mode != "schedule" && rl_control_mode != "stdin_json") {
         amrex::Abort("rl_control.mode must be 'schedule' or 'stdin_json'");
     }
+    if (hypre_control_mode != "off" && hypre_control_mode != "stdin_json") {
+        amrex::Abort("hypre_control.mode must be 'off' or 'stdin_json'");
+    }
     if (rl_stdin_json_control && !rl_schedule_path.empty()) {
         amrex::Abort("rl_control.schedule cannot be combined with rl_control.mode=stdin_json");
+    }
+    if (hypre_stdin_json_control && !(mlmg_use_hypre && mlmg_hypre_interface == 3)) {
+        amrex::Abort("hypre_control.mode=stdin_json requires mlmg.use_hypre=1 and mlmg.hypre_interface=3");
     }
 
     const auto rl_schedule = rl::LoadSchedule(rl_schedule_path);
@@ -422,6 +437,17 @@ void main_main ()
     Real mlmg_diffCoeffx = std::numeric_limits<Real>::quiet_NaN();
     Real mlmg_diffCoeffy = std::numeric_limits<Real>::quiet_NaN();
     rl::MlmgTelemetry mlmg_telemetry;
+    int hypre_setup_count = 0;
+    rl::HypreAction hypre_applied_action;
+
+    auto reset_mlmg_preconditioner_state = [&] ()
+    {
+        mlmg_preconditioner.reset();
+        mlmg_gamma = std::numeric_limits<Real>::quiet_NaN();
+        mlmg_segment = -1;
+        mlmg_diffCoeffx = std::numeric_limits<Real>::quiet_NaN();
+        mlmg_diffCoeffy = std::numeric_limits<Real>::quiet_NaN();
+    };
 
     auto gamma_has_changed = [&] (Real gamma)
     {
@@ -461,6 +487,76 @@ void main_main ()
         mlmg_segment = coeffs.segment;
         mlmg_diffCoeffx = coeffs.x;
         mlmg_diffCoeffy = coeffs.y;
+    };
+
+    auto add_hypre_int = [&] (const std::string& key, int value)
+    {
+        if (value >= 0) {
+            ParmParse pp_hypre(mlmg_hypre_options_namespace);
+            pp_hypre.add(key, value);
+        }
+    };
+
+    auto add_hypre_real = [&] (const std::string& key, Real value)
+    {
+        if (value >= Real(0.0)) {
+            ParmParse pp_hypre(mlmg_hypre_options_namespace);
+            pp_hypre.add(key, value);
+        }
+    };
+
+    auto apply_hypre_action = [&] (const rl::HypreAction& action)
+    {
+        ParmParse pp_hypre(mlmg_hypre_options_namespace);
+        pp_hypre.add("bamg_use_old_default", false);
+        add_hypre_real("bamg_strong_threshold", action.strong_threshold);
+        add_hypre_int("bamg_coarsen_type", action.coarsen_type);
+        add_hypre_int("bamg_interp_type", action.interp_type);
+        add_hypre_real("bamg_max_row_sum", action.max_row_sum);
+        add_hypre_int("bamg_relax_type", action.relax_type);
+        add_hypre_int("bamg_num_sweeps", action.num_sweeps);
+        add_hypre_int("bamg_cycle_type", action.cycle_type);
+        add_hypre_int("bamg_max_levels", action.max_levels);
+        add_hypre_real("bamg_trunc_factor", action.trunc_factor);
+        add_hypre_int("bamg_pmax_elmts", action.pmax_elmts);
+        add_hypre_int("bamg_agg_num_levels", action.agg_num_levels);
+        add_hypre_int("bamg_agg_interp_type", action.agg_interp_type);
+        add_hypre_real("bamg_agg_trunc_factor", action.agg_trunc_factor);
+        add_hypre_int("bamg_agg_pmax_elmts", action.agg_pmax_elmts);
+        add_hypre_real("bamg_relax_wt", action.relax_wt);
+        add_hypre_int("bamg_relax_order", action.relax_order);
+        add_hypre_int("bamg_max_coarse_size", action.max_coarse_size);
+    };
+
+    auto make_hypre_setup_context = [&] (int setup, Real gamma, Real precond_time,
+                                         Real step_size)
+    {
+        const auto coeffs = diffusion_schedule.coefficients(precond_time);
+        const Real dx0 = dx[0];
+        const Real dt_context = std::isfinite(step_size) && step_size > Real(0.0)
+            ? step_size
+            : ((dt > Real(0.0)) ? dt : Real(0.0));
+        const Real dx2 = dx0 * dx0;
+        rl::HypreSetupContext context;
+        context.setup = setup;
+        context.time = precond_time;
+        context.gamma = gamma;
+        context.dt = dt_context;
+        context.n_cell = n_cell;
+        context.max_grid_size = max_grid_size;
+        context.dimension = AMREX_SPACEDIM;
+        context.dx = dx0;
+        context.advCoeffx = advCoeffx;
+        context.advCoeffy = advCoeffy;
+        context.active_diffCoeffx = coeffs.x;
+        context.active_diffCoeffy = coeffs.y;
+        context.cfl_adv_x = std::abs(advCoeffx) * dt_context / dx0;
+        context.cfl_adv_y = std::abs(advCoeffy) * dt_context / dx0;
+        context.cfl_diff_x = std::abs(coeffs.x) * dt_context / dx2;
+        context.cfl_diff_y = std::abs(coeffs.y) * dt_context / dx2;
+        context.tol = mlmg_reltol;
+        context.max_iter = mlmg_max_iter;
+        return context;
     };
 
     auto build_mlmg_preconditioner = [&](Real gamma, Real precond_time)
@@ -513,26 +609,57 @@ void main_main ()
         mlmg_gamma = gamma;
     };
 
-    auto precond_setup = [&](MultiFab& /* S_data */, MultiFab& /* S_rhs */, const Real precond_time,
-                             bool jok, bool& jcur, const Real gamma)
+    auto precond_setup = [&](MultiFab& /* S_data */, MultiFab& /* S_rhs */,
+                             const Real precond_time, bool jok, bool& jcur,
+                             const Real gamma, const Real step_size)
     {
+        const Real precond_setup_start = ParallelDescriptor::second();
+        const bool operator_changed = mlmg_operator_has_changed(gamma, precond_time);
+        if (hypre_stdin_json_control &&
+            (mlmg_preconditioner == nullptr || !jok || operator_changed))
+        {
+            ++hypre_setup_count;
+            const auto context =
+                make_hypre_setup_context(hypre_setup_count, gamma, precond_time, step_size);
+            const auto previous_action = hypre_current_action;
+            if (amrex::ParallelDescriptor::IOProcessor()) {
+                rl::WriteHypreSetupRequest(std::cout, context, hypre_current_action);
+                std::cout.flush();
+            }
+            rl::ReadJsonHypreActionFromStdin(hypre_setup_count, hypre_current_action);
+            if (hypre_current_action != previous_action) {
+                apply_hypre_action(hypre_current_action);
+                if (mlmg_preconditioner != nullptr) {
+                    reset_mlmg_preconditioner_state();
+                }
+            }
+            hypre_applied_action = hypre_current_action;
+            if (amrex::ParallelDescriptor::IOProcessor()) {
+                rl::WriteHypreSetup(std::cout, context, hypre_applied_action);
+                std::cout.flush();
+            }
+            if (rl_data_enabled && rl_output != nullptr) {
+                rl::WriteHypreSetup(*rl_output, context, hypre_applied_action);
+            }
+        }
+
         // The implicit diffusion Jacobian is constant for this problem, so a
         // SUNDIALS refresh only needs to update the gamma-scaled operator.
         if (mlmg_preconditioner == nullptr) {
             build_mlmg_preconditioner(gamma, precond_time);
             jcur = true;
-            return;
-        }
-
-        if (!jok) {
-            if (mlmg_operator_has_changed(gamma, precond_time)) {
+        } else if (!jok) {
+            if (operator_changed) {
                 update_mlmg_gamma(*mlmg_preconditioner, gamma, precond_time);
             }
             jcur = true;
-        } else if (mlmg_operator_has_changed(gamma, precond_time)) {
+        } else if (operator_changed) {
             update_mlmg_gamma(*mlmg_preconditioner, gamma, precond_time);
             jcur = true;
         }
+        Real precond_setup_time = ParallelDescriptor::second() - precond_setup_start;
+        ParallelDescriptor::ReduceRealMax(precond_setup_time);
+        rl::RecordMlmgPrecondSetup(mlmg_telemetry, precond_setup_time);
     };
 
     auto precond_solve = [&](MultiFab& S_soln, MultiFab& S_rhs, MultiFab& /* S_data */,
@@ -542,10 +669,36 @@ void main_main ()
     {
         AMREX_ALWAYS_ASSERT(mlmg_preconditioner != nullptr);
         S_soln.setVal(0.0);
+#ifdef AMREX_USE_HYPRE
+        const auto hypre_before = amrex::HypreIJIface::getGlobalTelemetry();
+#endif
         const Real mlmg_solve_start = ParallelDescriptor::second();
         mlmg_preconditioner->solver->solve({&S_soln}, {&S_rhs}, mlmg_reltol, mlmg_abstol);
         Real mlmg_solve_time = ParallelDescriptor::second() - mlmg_solve_start;
         ParallelDescriptor::ReduceRealMax(mlmg_solve_time);
+#ifdef AMREX_USE_HYPRE
+        const auto hypre_after = amrex::HypreIJIface::getGlobalTelemetry();
+        mlmg_telemetry.hypre_setup_calls +=
+            hypre_after.setup_calls - hypre_before.setup_calls;
+        mlmg_telemetry.hypre_solve_calls +=
+            hypre_after.solve_calls - hypre_before.solve_calls;
+        mlmg_telemetry.hypre_setup_wall_seconds +=
+            hypre_after.setup_wall_seconds - hypre_before.setup_wall_seconds;
+        mlmg_telemetry.hypre_solve_wall_seconds +=
+            hypre_after.solve_wall_seconds - hypre_before.solve_wall_seconds;
+        mlmg_telemetry.last_hypre_setup_wall_seconds =
+            hypre_after.last_setup_wall_seconds;
+        mlmg_telemetry.last_hypre_solve_wall_seconds =
+            hypre_after.last_solve_wall_seconds;
+        mlmg_telemetry.last_hypre_cum_nnz_ap =
+            hypre_after.last_cum_nnz_ap;
+        mlmg_telemetry.last_hypre_hierarchy_levels =
+            hypre_after.last_hierarchy_levels;
+        mlmg_telemetry.last_hypre_finest_rows =
+            hypre_after.last_finest_rows;
+        mlmg_telemetry.last_hypre_coarsest_rows =
+            hypre_after.last_coarsest_rows;
+#endif
 
         const int mlmg_iterations = mlmg_preconditioner->solver->getNumIters();
         rl::RecordMlmgSolve(mlmg_telemetry, mlmg_iterations, mlmg_solve_time,
@@ -554,11 +707,7 @@ void main_main ()
 
     auto build_integrator = [&] (Real integrator_time)
     {
-        mlmg_preconditioner.reset();
-        mlmg_gamma = std::numeric_limits<Real>::quiet_NaN();
-        mlmg_segment = -1;
-        mlmg_diffCoeffx = std::numeric_limits<Real>::quiet_NaN();
-        mlmg_diffCoeffy = std::numeric_limits<Real>::quiet_NaN();
+        reset_mlmg_preconditioner_state();
 
         auto integrator = std::make_unique<TimeIntegrator<MultiFab>>(phi, integrator_time);
         integrator->set_rhs(rhs_function);
@@ -598,7 +747,7 @@ void main_main ()
                                       diffusion_schedule.reinitialize_at_jumps,
                                       rl_schedule_path, rl_control_mode};
     rl::RecordRunStart(rl_output.get(), phi, rl_metadata, rl_current_action, rl_data_enabled);
-    if (rl_stdin_json_control && amrex::ParallelDescriptor::IOProcessor()) {
+    if (protocol_stdout && amrex::ParallelDescriptor::IOProcessor()) {
         std::cout.setf(std::ios::scientific);
         std::cout << std::setprecision(17);
         rl::WriteRunStart(std::cout, phi, rl_metadata, rl_current_action);
@@ -628,11 +777,7 @@ void main_main ()
             scan_time = jump_time;
         }
         if (crossed_jump) {
-            mlmg_preconditioner.reset();
-            mlmg_gamma = std::numeric_limits<Real>::quiet_NaN();
-            mlmg_segment = -1;
-            mlmg_diffCoeffx = std::numeric_limits<Real>::quiet_NaN();
-            mlmg_diffCoeffy = std::numeric_limits<Real>::quiet_NaN();
+            reset_mlmg_preconditioner_state();
             integrator->reinitialize(phi, time_after);
         }
     };
@@ -774,11 +919,7 @@ void main_main ()
                     amrex::Print() << "Diffusion jump at t = " << std::setprecision(17) << time
                                    << "; active " << diffusion_schedule.description(coeffs.segment)
                                    << "\n";
-                    mlmg_preconditioner.reset();
-                    mlmg_gamma = std::numeric_limits<Real>::quiet_NaN();
-                    mlmg_segment = -1;
-                    mlmg_diffCoeffx = std::numeric_limits<Real>::quiet_NaN();
-                    mlmg_diffCoeffy = std::numeric_limits<Real>::quiet_NaN();
+                    reset_mlmg_preconditioner_state();
                     integrator->reinitialize(phi, time);
                 }
             }
@@ -817,7 +958,7 @@ void main_main ()
                                          episode_valid, time, evolution_stop_time,
                                          analytic_error, mlmg_telemetry, rl_metadata);
     }
-    if (rl_stdin_json_control && amrex::ParallelDescriptor::IOProcessor()) {
+    if (protocol_stdout && amrex::ParallelDescriptor::IOProcessor()) {
         episode_valid = rl::WriteRunEnd(std::cout, phi, completed_steps,
                                         episode_valid, time, evolution_stop_time,
                                         analytic_error, mlmg_telemetry, rl_metadata);

@@ -356,8 +356,9 @@ void main_main ()
         mlmg_gamma = gamma;
     };
 
-    auto precond_setup = [&](MultiFab& /* S_data */, MultiFab& /* S_rhs */, const Real /* time */,
-                             bool jok, bool& jcur, const Real gamma)
+    auto precond_setup = [&](MultiFab& /* S_data */, MultiFab& /* S_rhs */,
+                             const Real /* time */, bool jok, bool& jcur,
+                             const Real gamma, const Real /* step_size */)
     {
         // The implicit diffusion Jacobian is constant for this problem, so a
         // SUNDIALS refresh only needs to update the gamma-scaled operator.

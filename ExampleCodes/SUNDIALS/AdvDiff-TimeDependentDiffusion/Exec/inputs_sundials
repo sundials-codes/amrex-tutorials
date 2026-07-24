@@ -63,6 +63,8 @@ integration.sundials.max_linear_iters = 20
 # rl_control.mode = schedule
 # rl_control.mode = stdin_json
 # rl_control.schedule = schedule.csv
+# hypre_control.mode = off
+# hypre_control.mode = stdin_json
 
 # MLMG settings for the SUNDIALS preconditioner solve
 mlmg.max_iter = 100

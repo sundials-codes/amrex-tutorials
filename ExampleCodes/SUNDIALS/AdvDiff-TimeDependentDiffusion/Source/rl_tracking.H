@@ -33,13 +33,94 @@ struct Action {
     int force_jac_eval = 0;
 };
 
+struct HypreAction {
+    int setup = 0;
+    amrex::Real strong_threshold = amrex::Real(-1.0);
+    int coarsen_type = -1;
+    int interp_type = -1;
+    amrex::Real max_row_sum = amrex::Real(-1.0);
+    int relax_type = -1;
+    int num_sweeps = -1;
+    int cycle_type = -1;
+    int max_levels = -1;
+    amrex::Real trunc_factor = amrex::Real(-1.0);
+    int pmax_elmts = -1;
+    int agg_num_levels = -1;
+    int agg_interp_type = -1;
+    amrex::Real agg_trunc_factor = amrex::Real(-1.0);
+    int agg_pmax_elmts = -1;
+    amrex::Real relax_wt = amrex::Real(-1.0);
+    int relax_order = -1;
+    int max_coarse_size = -1;
+};
+
+struct HypreSetupContext {
+    int setup = 0;
+    amrex::Real time = amrex::Real(0.0);
+    amrex::Real gamma = amrex::Real(0.0);
+    amrex::Real dt = amrex::Real(0.0);
+    int n_cell = 0;
+    int max_grid_size = 0;
+    int dimension = AMREX_SPACEDIM;
+    amrex::Real dx = amrex::Real(0.0);
+    amrex::Real advCoeffx = amrex::Real(0.0);
+    amrex::Real advCoeffy = amrex::Real(0.0);
+    amrex::Real active_diffCoeffx = amrex::Real(0.0);
+    amrex::Real active_diffCoeffy = amrex::Real(0.0);
+    amrex::Real cfl_adv_x = amrex::Real(0.0);
+    amrex::Real cfl_adv_y = amrex::Real(0.0);
+    amrex::Real cfl_diff_x = amrex::Real(0.0);
+    amrex::Real cfl_diff_y = amrex::Real(0.0);
+    amrex::Real tol = amrex::Real(0.0);
+    int max_iter = 0;
+};
+
 struct MlmgTelemetry {
+    long precond_setup_calls = 0;
+    amrex::Real precond_setup_wall_seconds = amrex::Real(0.0);
     long solve_calls = 0;
     long iterations = 0;
     amrex::Real wall_seconds = amrex::Real(0.0);
+    long hypre_setup_calls = 0;
+    long hypre_solve_calls = 0;
+    amrex::Real hypre_setup_wall_seconds = amrex::Real(0.0);
+    amrex::Real hypre_solve_wall_seconds = amrex::Real(0.0);
+    amrex::Real last_precond_setup_wall_seconds = amrex::Real(0.0);
     int last_iterations = 0;
     amrex::Real last_residual = amrex::Real(-1.0);
+    amrex::Real last_hypre_setup_wall_seconds = amrex::Real(0.0);
+    amrex::Real last_hypre_solve_wall_seconds = amrex::Real(0.0);
+    amrex::Real last_hypre_cum_nnz_ap = amrex::Real(-1.0);
+    int last_hypre_hierarchy_levels = 0;
+    long last_hypre_finest_rows = 0;
+    long last_hypre_coarsest_rows = 0;
 };
+
+inline bool operator== (const HypreAction& lhs, const HypreAction& rhs)
+{
+    return lhs.strong_threshold == rhs.strong_threshold &&
+           lhs.coarsen_type == rhs.coarsen_type &&
+           lhs.interp_type == rhs.interp_type &&
+           lhs.max_row_sum == rhs.max_row_sum &&
+           lhs.relax_type == rhs.relax_type &&
+           lhs.num_sweeps == rhs.num_sweeps &&
+           lhs.cycle_type == rhs.cycle_type &&
+           lhs.max_levels == rhs.max_levels &&
+           lhs.trunc_factor == rhs.trunc_factor &&
+           lhs.pmax_elmts == rhs.pmax_elmts &&
+           lhs.agg_num_levels == rhs.agg_num_levels &&
+           lhs.agg_interp_type == rhs.agg_interp_type &&
+           lhs.agg_trunc_factor == rhs.agg_trunc_factor &&
+           lhs.agg_pmax_elmts == rhs.agg_pmax_elmts &&
+           lhs.relax_wt == rhs.relax_wt &&
+           lhs.relax_order == rhs.relax_order &&
+           lhs.max_coarse_size == rhs.max_coarse_size;
+}
+
+inline bool operator!= (const HypreAction& lhs, const HypreAction& rhs)
+{
+    return !(lhs == rhs);
+}
 
 struct PhiSummary {
     amrex::Real min = amrex::Real(0.0);
@@ -256,6 +337,94 @@ inline bool ParseJsonAction (const std::string& line, int step, Action& action)
     return saw_field;
 }
 
+inline bool ParseJsonHypreAction (const std::string& line, int setup, HypreAction& action)
+{
+    HypreAction parsed = action;
+    parsed.setup = setup;
+
+    double value = 0.0;
+    bool saw_field = false;
+    if (ExtractJsonNumber(line, "strong_threshold", value)) {
+        parsed.strong_threshold = static_cast<amrex::Real>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "coarsen_type", value)) {
+        parsed.coarsen_type = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "interp_type", value)) {
+        parsed.interp_type = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "max_row_sum", value)) {
+        parsed.max_row_sum = static_cast<amrex::Real>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "relax_type", value)) {
+        parsed.relax_type = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "num_sweeps", value)) {
+        parsed.num_sweeps = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "cycle_type", value)) {
+        parsed.cycle_type = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "max_levels", value)) {
+        parsed.max_levels = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "trunc_factor", value)) {
+        parsed.trunc_factor = static_cast<amrex::Real>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "P_max_elmts", value) ||
+        ExtractJsonNumber(line, "pmax_elmts", value))
+    {
+        parsed.pmax_elmts = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "agg_num_levels", value)) {
+        parsed.agg_num_levels = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "agg_interp_type", value)) {
+        parsed.agg_interp_type = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "agg_tr", value) ||
+        ExtractJsonNumber(line, "agg_trunc_factor", value))
+    {
+        parsed.agg_trunc_factor = static_cast<amrex::Real>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "agg_Pmx", value) ||
+        ExtractJsonNumber(line, "agg_pmax_elmts", value))
+    {
+        parsed.agg_pmax_elmts = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "relax_wt", value)) {
+        parsed.relax_wt = static_cast<amrex::Real>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "relax_order", value)) {
+        parsed.relax_order = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "max_coarse_size", value)) {
+        parsed.max_coarse_size = static_cast<int>(value);
+        saw_field = true;
+    }
+
+    if (saw_field) {
+        action = parsed;
+    }
+    return saw_field;
+}
+
 inline void BroadcastAction (Action& action)
 {
     const int root = amrex::ParallelDescriptor::IOProcessorNumber();
@@ -267,6 +436,29 @@ inline void BroadcastAction (Action& action)
     amrex::ParallelDescriptor::Bcast(&action.jac_eval_frequency, 1, root);
     amrex::ParallelDescriptor::Bcast(&action.force_lsetup, 1, root);
     amrex::ParallelDescriptor::Bcast(&action.force_jac_eval, 1, root);
+}
+
+inline void BroadcastHypreAction (HypreAction& action)
+{
+    const int root = amrex::ParallelDescriptor::IOProcessorNumber();
+    amrex::ParallelDescriptor::Bcast(&action.setup, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.strong_threshold, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.coarsen_type, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.interp_type, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.max_row_sum, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.relax_type, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.num_sweeps, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.cycle_type, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.max_levels, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.trunc_factor, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.pmax_elmts, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.agg_num_levels, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.agg_interp_type, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.agg_trunc_factor, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.agg_pmax_elmts, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.relax_wt, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.relax_order, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.max_coarse_size, 1, root);
 }
 
 inline void ReadJsonActionFromStdin (int step, Action& action)
@@ -284,6 +476,24 @@ inline void ReadJsonActionFromStdin (int step, Action& action)
     BroadcastAction(action);
     if (ok == 0) {
         amrex::Abort("Expected JSON action on stdin for rl_control.mode=stdin_json");
+    }
+}
+
+inline void ReadJsonHypreActionFromStdin (int setup, HypreAction& action)
+{
+    int ok = 1;
+    if (amrex::ParallelDescriptor::IOProcessor()) {
+        std::string line;
+        if (!std::getline(std::cin, line) || !ParseJsonHypreAction(line, setup, action)) {
+            ok = 0;
+        }
+    }
+
+    const int root = amrex::ParallelDescriptor::IOProcessorNumber();
+    amrex::ParallelDescriptor::Bcast(&ok, 1, root);
+    BroadcastHypreAction(action);
+    if (ok == 0) {
+        amrex::Abort("Expected JSON HYPRE action on stdin for hypre_control.mode=stdin_json");
     }
 }
 
@@ -334,12 +544,35 @@ inline amrex::SundialsIntegratorStats operator- (const amrex::SundialsIntegrator
 inline MlmgTelemetry operator- (const MlmgTelemetry& after, const MlmgTelemetry& before)
 {
     MlmgTelemetry delta;
+    delta.precond_setup_calls = after.precond_setup_calls - before.precond_setup_calls;
+    delta.precond_setup_wall_seconds =
+        after.precond_setup_wall_seconds - before.precond_setup_wall_seconds;
     delta.solve_calls = after.solve_calls - before.solve_calls;
     delta.iterations = after.iterations - before.iterations;
     delta.wall_seconds = after.wall_seconds - before.wall_seconds;
+    delta.hypre_setup_calls = after.hypre_setup_calls - before.hypre_setup_calls;
+    delta.hypre_solve_calls = after.hypre_solve_calls - before.hypre_solve_calls;
+    delta.hypre_setup_wall_seconds =
+        after.hypre_setup_wall_seconds - before.hypre_setup_wall_seconds;
+    delta.hypre_solve_wall_seconds =
+        after.hypre_solve_wall_seconds - before.hypre_solve_wall_seconds;
+    delta.last_precond_setup_wall_seconds = after.last_precond_setup_wall_seconds;
     delta.last_iterations = after.last_iterations;
     delta.last_residual = after.last_residual;
+    delta.last_hypre_setup_wall_seconds = after.last_hypre_setup_wall_seconds;
+    delta.last_hypre_solve_wall_seconds = after.last_hypre_solve_wall_seconds;
+    delta.last_hypre_cum_nnz_ap = after.last_hypre_cum_nnz_ap;
+    delta.last_hypre_hierarchy_levels = after.last_hypre_hierarchy_levels;
+    delta.last_hypre_finest_rows = after.last_hypre_finest_rows;
+    delta.last_hypre_coarsest_rows = after.last_hypre_coarsest_rows;
     return delta;
+}
+
+inline void RecordMlmgPrecondSetup (MlmgTelemetry& telemetry, amrex::Real wall_seconds)
+{
+    telemetry.precond_setup_calls += 1;
+    telemetry.precond_setup_wall_seconds += wall_seconds;
+    telemetry.last_precond_setup_wall_seconds = wall_seconds;
 }
 
 inline void RecordMlmgSolve (MlmgTelemetry& telemetry, int iterations,
@@ -453,11 +686,24 @@ inline void WriteSundialsStats (std::ostream& os,
 
 inline void WriteMlmgTelemetry (std::ostream& os, const MlmgTelemetry& stats)
 {
-    os << "{\"solve_calls\":" << stats.solve_calls
+    os << "{\"precond_setup_calls\":" << stats.precond_setup_calls
+       << ",\"precond_setup_wall_seconds\":" << stats.precond_setup_wall_seconds
+       << ",\"solve_calls\":" << stats.solve_calls
        << ",\"iterations\":" << stats.iterations
        << ",\"wall_seconds\":" << stats.wall_seconds
+       << ",\"hypre_setup_calls\":" << stats.hypre_setup_calls
+       << ",\"hypre_solve_calls\":" << stats.hypre_solve_calls
+       << ",\"hypre_setup_wall_seconds\":" << stats.hypre_setup_wall_seconds
+       << ",\"hypre_solve_wall_seconds\":" << stats.hypre_solve_wall_seconds
+       << ",\"last_precond_setup_wall_seconds\":" << stats.last_precond_setup_wall_seconds
        << ",\"last_iterations\":" << stats.last_iterations
        << ",\"last_residual\":" << stats.last_residual
+       << ",\"last_hypre_setup_wall_seconds\":" << stats.last_hypre_setup_wall_seconds
+       << ",\"last_hypre_solve_wall_seconds\":" << stats.last_hypre_solve_wall_seconds
+       << ",\"last_hypre_cum_nnz_ap\":" << stats.last_hypre_cum_nnz_ap
+       << ",\"last_hypre_hierarchy_levels\":" << stats.last_hypre_hierarchy_levels
+       << ",\"last_hypre_finest_rows\":" << stats.last_hypre_finest_rows
+       << ",\"last_hypre_coarsest_rows\":" << stats.last_hypre_coarsest_rows
        << "}";
 }
 
@@ -496,6 +742,75 @@ inline void WriteAction (std::ostream& os, const Action& action)
        << ",\"force_lsetup\":" << action.force_lsetup
        << ",\"force_jac_eval\":" << action.force_jac_eval
        << "}";
+}
+
+inline void WriteHypreAction (std::ostream& os, const HypreAction& action)
+{
+    os << "{\"strong_threshold\":" << action.strong_threshold
+       << ",\"coarsen_type\":" << action.coarsen_type
+       << ",\"interp_type\":" << action.interp_type
+       << ",\"max_row_sum\":" << action.max_row_sum
+       << ",\"relax_type\":" << action.relax_type
+       << ",\"num_sweeps\":" << action.num_sweeps
+       << ",\"cycle_type\":" << action.cycle_type
+       << ",\"max_levels\":" << action.max_levels
+       << ",\"trunc_factor\":" << action.trunc_factor
+       << ",\"P_max_elmts\":" << action.pmax_elmts
+       << ",\"agg_num_levels\":" << action.agg_num_levels
+       << ",\"agg_interp_type\":" << action.agg_interp_type
+       << ",\"agg_tr\":" << action.agg_trunc_factor
+       << ",\"agg_Pmx\":" << action.agg_pmax_elmts
+       << ",\"relax_wt\":" << action.relax_wt
+       << ",\"relax_order\":" << action.relax_order
+       << ",\"max_coarse_size\":" << action.max_coarse_size
+       << "}";
+}
+
+inline void WriteHypreSetupContext (std::ostream& os, const HypreSetupContext& context)
+{
+    os << "{\"setup\":" << context.setup
+       << ",\"time\":" << context.time
+       << ",\"gamma\":" << context.gamma
+       << ",\"dt\":" << context.dt
+       << ",\"n_cell\":" << context.n_cell
+       << ",\"max_grid_size\":" << context.max_grid_size
+       << ",\"dimension\":" << context.dimension
+       << ",\"dx\":" << context.dx
+       << ",\"advCoeffx\":" << context.advCoeffx
+       << ",\"advCoeffy\":" << context.advCoeffy
+       << ",\"active_diffCoeffx\":" << context.active_diffCoeffx
+       << ",\"active_diffCoeffy\":" << context.active_diffCoeffy
+       << ",\"cfl_adv_x\":" << context.cfl_adv_x
+       << ",\"cfl_adv_y\":" << context.cfl_adv_y
+       << ",\"cfl_diff_x\":" << context.cfl_diff_x
+       << ",\"cfl_diff_y\":" << context.cfl_diff_y
+       << ",\"tol\":" << context.tol
+       << ",\"max_iter\":" << context.max_iter
+       << "}";
+}
+
+inline void WriteHypreSetupRequest (std::ostream& output, const HypreSetupContext& context,
+                                    const HypreAction& current_action)
+{
+    output << "{\"event\":\"hypre_setup_request\""
+           << ",\"setup\":" << context.setup
+           << ",\"hypre_context\":";
+    WriteHypreSetupContext(output, context);
+    output << ",\"current_hypre_action\":";
+    WriteHypreAction(output, current_action);
+    output << "}\n";
+}
+
+inline void WriteHypreSetup (std::ostream& output, const HypreSetupContext& context,
+                             const HypreAction& action)
+{
+    output << "{\"event\":\"hypre_setup\""
+           << ",\"setup\":" << context.setup
+           << ",\"hypre_context\":";
+    WriteHypreSetupContext(output, context);
+    output << ",\"hypre_action\":";
+    WriteHypreAction(output, action);
+    output << "}\n";
 }
 
 inline void WriteRunStart (std::ostream& output, const amrex::MultiFab& phi,
