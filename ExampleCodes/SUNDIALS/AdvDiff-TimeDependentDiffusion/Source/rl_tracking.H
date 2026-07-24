@@ -29,6 +29,8 @@ struct Action {
     amrex::Real eps_lin = amrex::Real(-1.0);
     int lsetup_frequency = 0;
     long jac_eval_frequency = 0;
+    int force_lsetup = 0;
+    int force_jac_eval = 0;
 };
 
 struct MlmgTelemetry {
@@ -78,6 +80,8 @@ struct RunMetadata {
     std::vector<amrex::Real> diffusion_times;
     std::vector<amrex::Real> diffusion_x_multipliers;
     std::vector<amrex::Real> diffusion_y_multipliers;
+    std::string diffusion_interpolation = "constant";
+    bool diffusion_reinitialize_at_jumps = true;
     std::string schedule_path;
     std::string control_mode;
 };
@@ -138,10 +142,11 @@ inline std::vector<Action> LoadSchedule (const std::string& path)
             fields.push_back(Trim(field));
         }
 
-        if (fields.size() != 6) {
+        if (fields.size() != 6 && fields.size() != 8) {
             amrex::Abort("Bad rl_control.schedule line " + std::to_string(line_number) +
                          ": expected step,nlscoef,max_nonlinear_iters,"
-                         "eps_lin,lsetup_frequency,jac_eval_frequency");
+                         "eps_lin,lsetup_frequency,jac_eval_frequency"
+                         "[,force_lsetup,force_jac_eval]");
         }
 
         if (fields[0].empty() ||
@@ -157,6 +162,10 @@ inline std::vector<Action> LoadSchedule (const std::string& path)
         action.eps_lin = static_cast<amrex::Real>(std::stod(fields[3]));
         action.lsetup_frequency = std::stoi(fields[4]);
         action.jac_eval_frequency = std::stol(fields[5]);
+        if (fields.size() == 8) {
+            action.force_lsetup = std::stoi(fields[6]);
+            action.force_jac_eval = std::stoi(fields[7]);
+        }
         schedule.push_back(action);
     }
 
@@ -230,6 +239,16 @@ inline bool ParseJsonAction (const std::string& line, int step, Action& action)
         parsed.jac_eval_frequency = static_cast<long>(value);
         saw_field = true;
     }
+    if (ExtractJsonNumber(line, "force_lsetup", value)) {
+        parsed.force_lsetup = static_cast<int>(value);
+        saw_field = true;
+    }
+    if (ExtractJsonNumber(line, "force_jac_eval", value) ||
+        ExtractJsonNumber(line, "force_jaceval", value))
+    {
+        parsed.force_jac_eval = static_cast<int>(value);
+        saw_field = true;
+    }
 
     if (saw_field) {
         action = parsed;
@@ -246,6 +265,8 @@ inline void BroadcastAction (Action& action)
     amrex::ParallelDescriptor::Bcast(&action.eps_lin, 1, root);
     amrex::ParallelDescriptor::Bcast(&action.lsetup_frequency, 1, root);
     amrex::ParallelDescriptor::Bcast(&action.jac_eval_frequency, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.force_lsetup, 1, root);
+    amrex::ParallelDescriptor::Bcast(&action.force_jac_eval, 1, root);
 }
 
 inline void ReadJsonActionFromStdin (int step, Action& action)
@@ -368,18 +389,32 @@ inline ActiveDiffusion ActiveDiffusionAt (const RunMetadata& metadata, amrex::Re
         return active;
     }
 
-    int segment = 0;
+    std::size_t segment = 0;
     for (std::size_t i = 0; i < count; ++i) {
         if (time >= metadata.diffusion_times[i]) {
-            segment = static_cast<int>(i);
+            segment = i;
         } else {
             break;
         }
     }
 
-    active.segment = segment;
+    active.segment = static_cast<int>(segment);
     active.x_multiplier = metadata.diffusion_x_multipliers[segment];
     active.y_multiplier = metadata.diffusion_y_multipliers[segment];
+    if (metadata.diffusion_interpolation == "linear" && segment + 1 < count) {
+        const amrex::Real span = metadata.diffusion_times[segment + 1] -
+                                 metadata.diffusion_times[segment];
+        const amrex::Real theta = span > amrex::Real(0.0)
+            ? std::clamp((time - metadata.diffusion_times[segment]) / span,
+                         amrex::Real(0.0), amrex::Real(1.0))
+            : amrex::Real(0.0);
+        active.x_multiplier =
+            (amrex::Real(1.0) - theta) * metadata.diffusion_x_multipliers[segment] +
+            theta * metadata.diffusion_x_multipliers[segment + 1];
+        active.y_multiplier =
+            (amrex::Real(1.0) - theta) * metadata.diffusion_y_multipliers[segment] +
+            theta * metadata.diffusion_y_multipliers[segment + 1];
+    }
     active.x = metadata.diffCoeffx * active.x_multiplier;
     active.y = metadata.diffCoeffy * active.y_multiplier;
     return active;
@@ -458,6 +493,8 @@ inline void WriteAction (std::ostream& os, const Action& action)
        << ",\"eps_lin\":" << action.eps_lin
        << ",\"lsetup_frequency\":" << action.lsetup_frequency
        << ",\"jac_eval_frequency\":" << action.jac_eval_frequency
+       << ",\"force_lsetup\":" << action.force_lsetup
+       << ",\"force_jac_eval\":" << action.force_jac_eval
        << "}";
 }
 
@@ -484,6 +521,10 @@ inline void WriteRunStart (std::ostream& output, const amrex::MultiFab& phi,
     output << ",\"diffusion_y_multipliers\":";
     WriteRealArray(output, metadata.diffusion_y_multipliers);
     output
+           << ",\"diffusion_interpolation\":\""
+           << JsonEscape(metadata.diffusion_interpolation) << "\""
+           << ",\"diffusion_reinitialize_at_jumps\":"
+           << (metadata.diffusion_reinitialize_at_jumps ? "true" : "false")
            << ",\"initial_nlscoef\":" << initial_action.nlscoef
            << ",\"initial_max_nonlinear_iters\":"
            << initial_action.max_nonlinear_iters
@@ -492,6 +533,8 @@ inline void WriteRunStart (std::ostream& output, const amrex::MultiFab& phi,
            << initial_action.lsetup_frequency
            << ",\"initial_jac_eval_frequency\":"
            << initial_action.jac_eval_frequency
+           << ",\"initial_force_lsetup\":" << initial_action.force_lsetup
+           << ",\"initial_force_jac_eval\":" << initial_action.force_jac_eval
            << ",\"schedule\":\"" << JsonEscape(metadata.schedule_path) << "\""
            << ",\"control_mode\":\"" << JsonEscape(metadata.control_mode) << "\""
            << ",\"phi_initial\":";
@@ -560,7 +603,9 @@ inline void WriteTransition (std::ostream& output, int control_step,
     const bool step_valid = StepIsValid(after);
     const auto active = ActiveDiffusionAt(metadata, time_start);
     const auto active_after = ActiveDiffusionAt(metadata, time_after);
-    const bool crossed_diffusion_jump = active.segment != active_after.segment;
+    const bool crossed_diffusion_jump =
+        metadata.diffusion_interpolation == "constant" &&
+        active.segment != active_after.segment;
 
     output << "{\"event\":\"transition\""
            << ",\"control_step\":" << control_step

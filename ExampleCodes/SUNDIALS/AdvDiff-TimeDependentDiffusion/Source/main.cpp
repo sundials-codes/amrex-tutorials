@@ -38,6 +38,8 @@ struct DiffusionSchedule {
     std::vector<Real> y_multipliers{1.0};
     Real base_x = 1.0;
     Real base_y = 1.0;
+    std::string interpolation = "constant";
+    bool reinitialize_at_jumps = true;
 
     void validate () const
     {
@@ -66,6 +68,9 @@ struct DiffusionSchedule {
         if (times.front() > 0.0) {
             amrex::Abort("diffusion.times must start at or before t=0");
         }
+        if (interpolation != "constant" && interpolation != "linear") {
+            amrex::Abort("diffusion.interpolation must be 'constant' or 'linear'");
+        }
     }
 
     DiffusionCoefficients coefficients (Real time) const
@@ -74,6 +79,21 @@ struct DiffusionSchedule {
         std::size_t index = upper == times.begin()
             ? std::size_t(0)
             : static_cast<std::size_t>(std::distance(times.begin(), upper) - 1);
+        if (interpolation == "linear" && index + 1 < times.size()) {
+            const Real span = times[index + 1] - times[index];
+            const Real theta = span > Real(0.0)
+                ? std::clamp((time - times[index]) / span, Real(0.0), Real(1.0))
+                : Real(0.0);
+            const Real x_multiplier =
+                (Real(1.0) - theta) * x_multipliers[index] +
+                theta * x_multipliers[index + 1];
+            const Real y_multiplier =
+                (Real(1.0) - theta) * y_multipliers[index] +
+                theta * y_multipliers[index + 1];
+            return {base_x * x_multiplier, base_y * y_multiplier,
+                    static_cast<int>(index)};
+        }
+
         return {base_x * x_multipliers[index], base_y * y_multipliers[index],
                 static_cast<int>(index)};
     }
@@ -85,6 +105,9 @@ struct DiffusionSchedule {
 
     bool next_jump_after (Real time, Real limit, Real& jump_time) const
     {
+        if (interpolation != "constant" || !reinitialize_at_jumps) {
+            return false;
+        }
         const Real scale = std::max({Real(1.0), std::abs(time), std::abs(limit)});
         const Real eps = Real(100.0) * std::numeric_limits<Real>::epsilon() * scale;
         auto next = std::upper_bound(times.begin(), times.end(), time + eps);
@@ -222,6 +245,10 @@ void main_main ()
         pp_diffusion.queryarr("times", diffusion_schedule.times);
         pp_diffusion.queryarr("x_multipliers", diffusion_schedule.x_multipliers);
         pp_diffusion.queryarr("y_multipliers", diffusion_schedule.y_multipliers);
+        pp_diffusion.query("interpolation", diffusion_schedule.interpolation);
+        diffusion_schedule.reinitialize_at_jumps =
+            diffusion_schedule.interpolation == "constant";
+        pp_diffusion.query("reinitialize_at_jumps", diffusion_schedule.reinitialize_at_jumps);
         diffusion_schedule.validate();
 
         ParmParse pp_output("output");
@@ -247,6 +274,8 @@ void main_main ()
         pp_sundials.query("lsetup_frequency", rl_current_action.lsetup_frequency);
         pp_sundials.query("jac_eval_frequency", rl_current_action.jac_eval_frequency);
         pp_sundials.query("jacevalfrequency", rl_current_action.jac_eval_frequency);
+        pp_sundials.query("force_lsetup", rl_current_action.force_lsetup);
+        pp_sundials.query("force_jac_eval", rl_current_action.force_jac_eval);
 
         ParmParse pp_rl_data("rl_data");
         pp_rl_data.query("enabled", rl_data_enabled);
@@ -390,6 +419,8 @@ void main_main ()
     std::unique_ptr<MLMGPreconditioner> mlmg_preconditioner;
     Real mlmg_gamma = std::numeric_limits<Real>::quiet_NaN();
     int mlmg_segment = -1;
+    Real mlmg_diffCoeffx = std::numeric_limits<Real>::quiet_NaN();
+    Real mlmg_diffCoeffy = std::numeric_limits<Real>::quiet_NaN();
     rl::MlmgTelemetry mlmg_telemetry;
 
     auto gamma_has_changed = [&] (Real gamma)
@@ -404,7 +435,18 @@ void main_main ()
 
     auto mlmg_operator_has_changed = [&] (Real gamma, Real precond_time)
     {
-        return gamma_has_changed(gamma) || diffusion_schedule.segment(precond_time) != mlmg_segment;
+        const auto coeffs = diffusion_schedule.coefficients(precond_time);
+        const Real scale_x = std::max({Real(1.0), std::abs(coeffs.x), std::abs(mlmg_diffCoeffx)});
+        const Real scale_y = std::max({Real(1.0), std::abs(coeffs.y), std::abs(mlmg_diffCoeffy)});
+        const bool diff_x_changed =
+            !std::isfinite(mlmg_diffCoeffx) ||
+            std::abs(coeffs.x - mlmg_diffCoeffx) >
+                Real(10.0) * std::numeric_limits<Real>::epsilon() * scale_x;
+        const bool diff_y_changed =
+            !std::isfinite(mlmg_diffCoeffy) ||
+            std::abs(coeffs.y - mlmg_diffCoeffy) >
+                Real(10.0) * std::numeric_limits<Real>::epsilon() * scale_y;
+        return gamma_has_changed(gamma) || diff_x_changed || diff_y_changed;
     };
 
     auto update_mlmg_gamma = [&](MLMGPreconditioner& preconditioner, Real gamma, Real precond_time)
@@ -417,6 +459,8 @@ void main_main ()
         preconditioner.linop->setBCoeffs(0, amrex::GetArrOfConstPtrs(preconditioner.face_bcoef));
         mlmg_gamma = gamma;
         mlmg_segment = coeffs.segment;
+        mlmg_diffCoeffx = coeffs.x;
+        mlmg_diffCoeffy = coeffs.y;
     };
 
     auto build_mlmg_preconditioner = [&](Real gamma, Real precond_time)
@@ -487,6 +531,7 @@ void main_main ()
             jcur = true;
         } else if (mlmg_operator_has_changed(gamma, precond_time)) {
             update_mlmg_gamma(*mlmg_preconditioner, gamma, precond_time);
+            jcur = true;
         }
     };
 
@@ -512,6 +557,8 @@ void main_main ()
         mlmg_preconditioner.reset();
         mlmg_gamma = std::numeric_limits<Real>::quiet_NaN();
         mlmg_segment = -1;
+        mlmg_diffCoeffx = std::numeric_limits<Real>::quiet_NaN();
+        mlmg_diffCoeffy = std::numeric_limits<Real>::quiet_NaN();
 
         auto integrator = std::make_unique<TimeIntegrator<MultiFab>>(phi, integrator_time);
         integrator->set_rhs(rhs_function);
@@ -531,7 +578,9 @@ void main_main ()
                  rl_current_action.max_nonlinear_iters,
                  rl_current_action.eps_lin,
                  rl_current_action.lsetup_frequency,
-                 rl_current_action.jac_eval_frequency});
+                 rl_current_action.jac_eval_frequency,
+                 rl_current_action.force_lsetup != 0,
+                 rl_current_action.force_jac_eval != 0});
         }
 
         return integrator;
@@ -545,6 +594,8 @@ void main_main ()
                                       diffusion_schedule.times,
                                       diffusion_schedule.x_multipliers,
                                       diffusion_schedule.y_multipliers,
+                                      diffusion_schedule.interpolation,
+                                      diffusion_schedule.reinitialize_at_jumps,
                                       rl_schedule_path, rl_control_mode};
     rl::RecordRunStart(rl_output.get(), phi, rl_metadata, rl_current_action, rl_data_enabled);
     if (rl_stdin_json_control && amrex::ParallelDescriptor::IOProcessor()) {
@@ -580,6 +631,8 @@ void main_main ()
             mlmg_preconditioner.reset();
             mlmg_gamma = std::numeric_limits<Real>::quiet_NaN();
             mlmg_segment = -1;
+            mlmg_diffCoeffx = std::numeric_limits<Real>::quiet_NaN();
+            mlmg_diffCoeffy = std::numeric_limits<Real>::quiet_NaN();
             integrator->reinitialize(phi, time_after);
         }
     };
@@ -624,14 +677,19 @@ void main_main ()
                                          rl_current_action);
             }
 
+            const rl::Action rl_applied_action = rl_current_action;
             if (integrator->supports_sundials_controls()) {
                 integrator->set_sundials_nonlinear_control(
-                    {rl_current_action.nlscoef,
-                     rl_current_action.max_nonlinear_iters,
-                     rl_current_action.eps_lin,
-                     rl_current_action.lsetup_frequency,
-                     rl_current_action.jac_eval_frequency});
+                    {rl_applied_action.nlscoef,
+                     rl_applied_action.max_nonlinear_iters,
+                     rl_applied_action.eps_lin,
+                     rl_applied_action.lsetup_frequency,
+                     rl_applied_action.jac_eval_frequency,
+                     rl_applied_action.force_lsetup != 0,
+                     rl_applied_action.force_jac_eval != 0});
             }
+            rl_current_action.force_lsetup = 0;
+            rl_current_action.force_jac_eval = 0;
 
             Real step_start_time = ParallelDescriptor::second();
             const Real time_after = integrator->evolve_one_step(phi, time_limit);
@@ -653,12 +711,12 @@ void main_main ()
                 if (rl_data_enabled) {
                     step_valid = rl::RecordTransition(
                         rl_output.get(), control_step, time_start, time_limit, time_after,
-                        dt_actual, dt_proposed, rl_current_action, step_stop_time, rl_before,
+                        dt_actual, dt_proposed, rl_applied_action, step_stop_time, rl_before,
                         rl_after, rl_metadata) && step_valid;
                 }
                 if (rl_stdin_json_control && amrex::ParallelDescriptor::IOProcessor()) {
                     rl::WriteTransition(std::cout, control_step, time_start, time_limit,
-                                        time_after, dt_actual, dt_proposed, rl_current_action,
+                                        time_after, dt_actual, dt_proposed, rl_applied_action,
                                         step_stop_time, rl_before, rl_after, rl_metadata);
                     std::cout.flush();
                 }
@@ -719,6 +777,8 @@ void main_main ()
                     mlmg_preconditioner.reset();
                     mlmg_gamma = std::numeric_limits<Real>::quiet_NaN();
                     mlmg_segment = -1;
+                    mlmg_diffCoeffx = std::numeric_limits<Real>::quiet_NaN();
+                    mlmg_diffCoeffy = std::numeric_limits<Real>::quiet_NaN();
                     integrator->reinitialize(phi, time);
                 }
             }

@@ -10,6 +10,8 @@ diffCoeffy = 10000.
 diffusion.times = 0.0 0.03 0.06
 diffusion.x_multipliers = 1.0 4.0 1.0
 diffusion.y_multipliers = 1.0 4.0 1.0
+# diffusion.interpolation = constant # constant or linear
+# diffusion.reinitialize_at_jumps = true
 
 dt = 1.e-3  # nominal output interval; RL control advances one accepted ARKODE step at a time
 final_time = 0.1
