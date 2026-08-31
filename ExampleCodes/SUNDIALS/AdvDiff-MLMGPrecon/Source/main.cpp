@@ -34,7 +34,7 @@ void main_main ()
     if (AMREX_SPACEDIM != 2) {
         amrex::Abort("Only 2D supported; recompile with DIM=2");
     }
-    
+
     // **********************************
     // SIMULATION PARAMETERS
 
@@ -201,7 +201,7 @@ void main_main ()
         S_data.FillBoundary(geom.periodicity());
 
         S_rhs.setVal(0.);
-        
+
         ComputeDiffusion(S_rhs, S_data, diffCoeffx, diffCoeffy, dx);
         ComputeAdvection(S_rhs, S_data, advCoeffx, advCoeffy, dx);
     };
@@ -212,7 +212,7 @@ void main_main ()
         S_data.FillBoundary(geom.periodicity());
 
         S_rhs.setVal(0.);
-        
+
         ComputeDiffusion(S_rhs, S_data, diffCoeffx, diffCoeffy, dx);
     };
 
@@ -222,7 +222,7 @@ void main_main ()
         S_data.FillBoundary(geom.periodicity());
 
         S_rhs.setVal(0.);
-        
+
         ComputeAdvection(S_rhs, S_data, advCoeffx, advCoeffy, dx);
     };
 
@@ -390,7 +390,7 @@ void main_main ()
 
     MultiFab phi_exact_dist(ba,dm,Ncomp,0);
     phi_exact_dist.ParallelCopy(phi_exact,0,0,1);
-    
+
     MultiFab::Subtract(phi_exact_dist,phi,0,0,1,0);
 
     {
@@ -411,7 +411,7 @@ void InitializeData(MultiFab& phi,
                     const Real& Ay) {
 
     int ng = phi.nGrow();
-    
+
     GpuArray<Real,AMREX_SPACEDIM> L;
     for (int d=0; d<AMREX_SPACEDIM; ++d) {
         L[d] = prob_hi[d] - prob_lo[d];
