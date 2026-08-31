@@ -35,6 +35,28 @@ int main (int argc, char* argv[])
     amrex::Real dt;
 
     // **********************************
+    // DECLARE PHYSICS PARAMETERS
+    // **********************************
+
+    // diffusion coefficient for heat equation
+    amrex::Real diffusion_coeff;
+
+    // amplitude of initial temperature profile
+    amrex::Real init_amplitude;
+
+    // variance of the intitial temperature profile
+    amrex::Real init_variance;
+
+    // **********************************
+    // DECLARE DATALOG PARAMETERS
+    // **********************************
+    const int datwidth = 24;
+    const int datprecision = 16;
+    const int timeprecision = 13;
+    int datalog_int = -1;      // Interval for regular output (<=0 means no regular output)
+    std::string datalog_filename = "datalog.txt";
+
+    // **********************************
     // READ PARAMETER VALUES FROM INPUT DATA
     // **********************************
     // inputs parameters
@@ -62,6 +84,31 @@ int main (int argc, char* argv[])
 
         // time step
         pp.get("dt",dt);
+
+        // Default datalog_int to -1, allow us to set it to something else in the inputs file
+        //  If datalog_int < 0 then no plot files will be written
+        datalog_int = -1;
+        pp.query("datalog_int",datalog_int);
+
+        datalog_filename = "datalog.txt";
+        pp.query("datalog",datalog_filename);
+
+        // **********************************
+        // READ PHYSICS PARAMETERS
+        // **********************************
+
+        // Diffusion coefficient - controls how fast heat spreads
+        diffusion_coeff = 1.0;
+        pp.query("diffusion_coeff", diffusion_coeff);  // Note: input name is "diffusion" but variable is "diffusion_coeff"
+
+        // Initial temperature amplitude
+        init_amplitude = 1.0;
+        pp.query("init_amplitude", init_amplitude);
+
+        // Initial temperature variance
+        // Smaller values = more concentrated, larger values = more spread out
+        init_variance = 0.01;
+        pp.query("init_variance", init_variance);
     }
 
     // **********************************
@@ -113,6 +160,7 @@ int main (int argc, char* argv[])
     // we allocate two phi multifabs; one will store the old state, the other the new.
     amrex::MultiFab phi_old(ba, dm, Ncomp, Nghost);
     amrex::MultiFab phi_new(ba, dm, Ncomp, Nghost);
+    amrex::MultiFab phi_tmp(ba, dm, Ncomp, Nghost); // temporary used to calculate standard deviation
 
     // time = starting time in the simulation
     amrex::Real time = 0.0;
@@ -128,7 +176,17 @@ int main (int argc, char* argv[])
 
         const amrex::Array4<amrex::Real>& phiOld = phi_old.array(mfi);
 
-        // set phi = 1 + e^(-(r-0.5)^2)
+        // **********************************
+        // SET INITIAL TEMPERATURE PROFILE
+        // **********************************
+        // Formula: T = 1 + amplitude * exp(-r^2 / (2*variance))
+        // where r is distance from center (0.5, 0.5, 0.5)
+        //
+        // Parameters:
+        // - amplitude: controls peak temperature above baseline (1.0)
+        // - variance: controls spread of initial hot spot
+        //   - smaller variance = more concentrated
+        //   - larger variance = more spread out
         amrex::ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i, int j, int k)
         {
 
@@ -139,9 +197,22 @@ int main (int argc, char* argv[])
             amrex::Real x = (i+0.5) * dx[0];
             amrex::Real y = (j+0.5) * dx[1];
             amrex::Real z = (k+0.5) * dx[2];
-            amrex::Real rsquared = ((x-0.5)*(x-0.5)+(y-0.5)*(y-0.5)+(z-0.5)*(z-0.5))/0.01;
-            phiOld(i,j,k) = 1. + std::exp(-rsquared);
+            amrex::Real rsquared = ((x-0.5)*(x-0.5)+(y-0.5)*(y-0.5)+(z-0.5)*(z-0.5))/(2*init_variance);
+            phiOld(i,j,k) = 1. + init_amplitude * std::exp(-rsquared);
         });
+    }
+
+    // **********************************
+    // WRITE DATALOG FILE
+    // **********************************
+    if (amrex::ParallelDescriptor::IOProcessor()) {
+        std::ofstream datalog(datalog_filename);  // truncate mode to start fresh
+        datalog << "#" << std::setw(datwidth-1) << "     max_temp";
+        datalog << std::setw(datwidth) << "    mean_temp";
+        datalog << std::setw(datwidth) << "     std_temp";
+        datalog << std::setw(datwidth) << "    cell_temp";
+        datalog << std::endl;
+        datalog.close();
     }
 
     // **********************************
@@ -183,13 +254,40 @@ int main (int argc, char* argv[])
                 // EVOLVE VALUES FOR EACH CELL
                 // **********************************
 
-                phiNew(i,j,k) = phiOld(i,j,k) + dt *
+                phiNew(i,j,k) = phiOld(i,j,k) + dt * diffusion_coeff *
                     ( (phiOld(i+1,j,k) - 2.*phiOld(i,j,k) + phiOld(i-1,j,k)) / (dx[0]*dx[0])
                      +(phiOld(i,j+1,k) - 2.*phiOld(i,j,k) + phiOld(i,j-1,k)) / (dx[1]*dx[1])
                      +(phiOld(i,j,k+1) - 2.*phiOld(i,j,k) + phiOld(i,j,k-1)) / (dx[2]*dx[2])
                         );
             });
         }
+
+        // find the value in cell (9,9,9)
+        amrex::ReduceOps<amrex::ReduceOpSum> reduce_op;
+        amrex::ReduceData<amrex::Real> reduce_data(reduce_op);
+        using ReduceTuple = typename decltype(reduce_data)::Type;
+
+        for ( amrex::MFIter mfi(phi_old); mfi.isValid(); ++mfi )
+        {
+            const amrex::Box& bx = mfi.validbox();
+
+            const amrex::Array4<amrex::Real>& phiOld = phi_old.array(mfi);
+            const amrex::Array4<amrex::Real>& phiNew = phi_new.array(mfi);
+
+            // advance the data by dt
+            reduce_op.eval(bx, reduce_data,
+            [=] AMREX_GPU_DEVICE (int i, int j, int k) -> ReduceTuple
+            {
+                if (i==9 && j==9 && k==9) {
+                    return{phiNew(i,j,k)};
+                } else {
+                    return {0.};
+                }
+            });
+        }
+
+        amrex::Real cell_temperature = amrex::get<0>(reduce_data.value());
+        amrex::ParallelDescriptor::ReduceRealSum(cell_temperature);
 
         // **********************************
         // INCREMENT
@@ -204,6 +302,36 @@ int main (int argc, char* argv[])
         // Tell the I/O Processor to write out which step we're doing
         amrex::Print() << "Advanced step " << step << "\n";
 
+        // **********************************
+        // WRITE DATALOG AT GIVEN INTERVAL
+        // **********************************
+
+        // Check if we should write datalog
+        bool write_datalog = false;
+        if (step == nsteps) {
+            write_datalog = true;  // Write final step
+        } else if (datalog_int > 0 && step % datalog_int == 0) {
+            write_datalog = true;  // Write every datalog_int steps
+        }
+
+        amrex::MultiFab::Copy(phi_tmp, phi_new, 0, 0, 1, 0);
+        amrex::Real max_temperature = phi_new.max(0);
+        amrex::Real mean_temperature = phi_new.sum(0) / phi_new.boxArray().numPts();
+        phi_tmp.plus(-mean_temperature,0,1,0);
+        amrex::Real std_temperature = phi_tmp.norm2(0); // compute sqrt( sum(phi_tmp_i^2) );
+
+        if (write_datalog && amrex::ParallelDescriptor::IOProcessor()) {
+            std::ofstream datalog(datalog_filename, std::ios::app);
+
+            // Write 4 statistics
+            datalog << std::setw(datwidth) << std::setprecision(datprecision) << max_temperature;
+            datalog << std::setw(datwidth) << std::setprecision(datprecision) << mean_temperature;
+            datalog << std::setw(datwidth) << std::setprecision(datprecision) << std_temperature;
+            datalog << std::setw(datwidth) << std::setprecision(datprecision) << cell_temperature;
+            datalog << std::endl;
+
+            datalog.close();
+        }
 
         // **********************************
         // WRITE PLOTFILE AT GIVEN INTERVAL
